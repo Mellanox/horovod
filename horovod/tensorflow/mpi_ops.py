@@ -26,7 +26,6 @@ from tensorflow.python.framework import load_library
 from tensorflow.python.framework import ops
 from tensorflow.python.platform import resource_loader
 
-
 def _get_ext_suffix():
     """Determine library extension for various versions of Python."""
     ext_suffix = sysconfig.get_config_var('EXT_SUFFIX')
@@ -77,9 +76,14 @@ MPI_LIB = _load_library('mpi_lib' + _get_ext_suffix(),
 MPI_LIB_CTYPES = _load_ctypes_dll('mpi_lib' + _get_ext_suffix())
 
 
+def _init_reduce_counter():
+    global reduce_counter
+    reduce_counter = 0
+
 def init():
     """A function which initializes Horovod.
     """
+    _init_reduce_counter()
     return MPI_LIB_CTYPES.horovod_tensorflow_init()
 
 
@@ -128,7 +132,6 @@ def _normalize_name(name):
     """Normalizes operation name to TensorFlow rules."""
     return re.sub('[^a-zA-Z0-9_]', '_', name)
 
-
 def _allreduce(tensor, name=None):
     """An op which sums an input tensor over all the Horovod processes.
 
@@ -144,6 +147,24 @@ def _allreduce(tensor, name=None):
         name = 'HorovodAllreduce_%s' % _normalize_name(tensor.name)
     return MPI_LIB.horovod_allreduce(tensor, name=name)
 
+
+
+def _allreduce2(tensor, name=None):
+    """An op which sums an input tensor over all the Horovod processes.
+
+    The reduction operation is keyed by the name of the op. The tensor type and
+    shape must be the same on all Horovod processes for a given name. The reduction
+    will not start until all processes are ready to send and receive the tensor.
+
+    Returns:
+      A tensor of the same shape and type as `tensor`, summed across all
+      processes.
+    """
+    if name is None:
+        name = 'HorovodAllreduce_%s' % _normalize_name(tensor.name)
+    global reduce_counter
+    reduce_counter=reduce_counter+1
+    return MPI_LIB.horovod_allreduce2(tensor, name=name, idx=reduce_counter)
 
 ops.NotDifferentiable('HorovodAllreduce')
 
