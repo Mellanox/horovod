@@ -33,11 +33,25 @@
 #include <nccl.h>
 #endif
 
+#if HAVE_SHARP
+#include  <sharp.h>
+#endif
+
 #define OMPI_SKIP_MPICXX
 #include "hash_vector.h"
 #include "mpi.h"
 #include "mpi_message.h"
 #include "timeline.h"
+
+
+//#define HAVE_SHARP
+
+
+
+
+
+
+
 
 /*
  * Allreduce, Allgather and Broadcast Ops for TensorFlow.
@@ -1265,6 +1279,11 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   state.size = size;
   state.initialization_done = true;
 
+#ifdef HAVE_SHARP
+  printf("HAVE SHARP is defined!\n");
+#endif
+
+
   // Open the timeline file on coordinator.
   auto horovod_timeline = std::getenv("HOROVOD_TIMELINE");
   if (is_coordinator && horovod_timeline != nullptr) {
@@ -1504,6 +1523,15 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   //#endif
   MPI_Finalize();
 }
+
+
+
+void InitSharp(){
+
+
+
+}
+
 
 // Start Horovod background thread. Ensure that this is
 // only done once no matter how many times this function is called.

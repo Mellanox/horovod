@@ -177,6 +177,43 @@ def get_cuda_dirs(build_ext):
     return cuda_include_dirs, cuda_lib_dirs
 
 
+def get_sharp_dir(build_ext):
+    sharp_include_dirs = []
+    sharp_lib_dirs = []
+
+    sharp_home = os.environ.get('HOROVOD_SHARP_HOME')
+    if sharp_home:
+        sharp_include_dirs += ['%s/include' % sharp_home]
+        sharp_lib_dirs += ['%s/lib' % sharp_home, '%s/lib64' % sharp_home]
+
+    sharp_include = os.environ.get('HOROVOD_SHARP_INCLUDE')
+    if sharp_include:
+        sharp_include_dirs += [sharp_include]
+
+    sharp_lib = os.environ.get('HOROVOD_SHARP_LIB')
+    if sharp_lib:
+        sharp_lib_dirs += [sharp_lib]
+
+    try:
+        test_compile(build_ext, 'test_sharp', libraries=['sharp'], include_dirs=sharp_include_dirs,
+                     library_dirs=sharp_lib_dirs, code=textwrap.dedent('''\
+            #include <sharp.h>
+            void test() {
+              //TODO: test if sharp works.    
+            }
+            '''))
+    except (CompileError, LinkError):
+        raise DistutilsPlatformError(
+            'SHARP library or its later version was not found (see error above).\n'
+            'Please specify correct SHARP location via HOROVOD_SHARP_HOME '
+            'environment variable or combination of HOROVOD_SHARP_INCLUDE and '
+            'HOROVOD_SHARP_LIB environment variables.\n\n'
+            'HOROVOD_SHARP_HOME - path where NCCL include and lib directories can be found\n'
+            'HOROVOD_SHARP_INCLUDE - path to NCCL include directory\n'
+            'HOROVOD_SHARP_LIB - path to NCCL lib directory')
+
+    return sharp_include_dirs, sharp_lib_dirs
+
 def get_nccl_dirs(build_ext, cuda_include_dirs, cuda_lib_dirs):
     nccl_include_dirs = []
     nccl_lib_dirs = []
@@ -219,6 +256,7 @@ def get_nccl_dirs(build_ext, cuda_include_dirs, cuda_lib_dirs):
     return nccl_include_dirs, nccl_lib_dirs
 
 
+
 def fully_define_extension(build_ext):
     tf_include_dirs = get_tf_include_dirs()
     tf_lib_dirs = get_tf_lib_dirs()
@@ -227,6 +265,8 @@ def fully_define_extension(build_ext):
     mpi_flags = get_mpi_flags()
 
     gpu_allreduce = os.environ.get('HOROVOD_GPU_ALLREDUCE')
+    node_allreduce = os.environ.get('HOROVOD_NODE_ALLREDUCE')
+
     if gpu_allreduce and gpu_allreduce != 'MPI' and gpu_allreduce != 'NCCL':
         raise DistutilsError('HOROVOD_GPU_ALLREDUCE=%s is invalid, supported '
                              'values are "", "MPI", "NCCL".' % gpu_allreduce)
@@ -240,6 +280,10 @@ def fully_define_extension(build_ext):
     if gpu_broadcast and gpu_broadcast != 'MPI':
         raise DistutilsError('HOROVOD_GPU_BROADCAST=%s is invalid, supported '
                              'values are "", "MPI".' % gpu_broadcast)
+
+    if gpu_allreduce and gpu_allreduce != 'NCCL' and node_allreduce == 'SHARP':
+        raise DistutilsError('SHARP is not supported, and if it was supported it would have required NCCL')
+                             
 
     if gpu_allreduce or gpu_allgather or gpu_broadcast:
         have_cuda = True
@@ -255,6 +299,13 @@ def fully_define_extension(build_ext):
     else:
         have_nccl = False
         nccl_include_dirs = nccl_lib_dirs = []
+
+    if node_allreduce == 'SHARP':
+        have_sharp = True
+        sharp_include_dirs, sharp_lib_dirs = get_sharp_dirs(build_ext)
+    else:
+        have_sharp = False
+        sharp_include_dirs = sharp_lib_dirs = []
 
     MACROS = []
     INCLUDES = tf_include_dirs
@@ -280,6 +331,13 @@ def fully_define_extension(build_ext):
         INCLUDES += nccl_include_dirs
         LIBRARY_DIRS += nccl_lib_dirs
         LIBRARIES = ['nccl']
+
+    if have_sharp:
+        MACROS += [('HAVE_SHARP', '1')]
+        INCLUDES += sharp_include_dirs
+        LIBRARY_DIRS += sharp_lib_dirs
+        LIBRARIES = ['sharp']
+
 
     if gpu_allreduce:
         MACROS += [('HOROVOD_GPU_ALLREDUCE', "'%s'" % gpu_allreduce[0])]
