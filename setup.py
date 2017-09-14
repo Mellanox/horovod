@@ -21,6 +21,9 @@ import subprocess
 import textwrap
 import traceback
 
+os.environ["HOROVOD_SHARP_HOME"] = "/yanivbl/sharp/install"
+os.environ["HOROVOD_SHARP_INCLUDE"] = ""
+os.environ["HOROVOD_SHARP_LIB"] = ""
 
 tensorflow_mpi_lib = Extension('horovod.tensorflow.mpi_lib', [])
 
@@ -86,7 +89,7 @@ def get_tf_abi(build_ext, include_dirs, lib_dirs, libs):
                     auto ignore = tensorflow::strings::StrCat("a", "b");
                 }
                 '''))
-
+ 
             from tensorflow.python.framework import load_library
             load_library.load_op_library(lib_file)
 
@@ -194,12 +197,18 @@ def get_sharp_dir(build_ext):
     if sharp_lib:
         sharp_lib_dirs += [sharp_lib]
 
+
+    print(sharp_lib_dirs)
+    print(sharp_include_dirs)
+
     try:
-        test_compile(build_ext, 'test_sharp', libraries=['sharp'], include_dirs=sharp_include_dirs,
+        test_compile(build_ext, 'test_sharp', libraries=['sharp_coll'], include_dirs=sharp_include_dirs,
                      library_dirs=sharp_lib_dirs, code=textwrap.dedent('''\
-            #include <sharp.h>
+            #include <stdlib.h>
+            #include <stdio.h>
+            #include <sharp/api/sharp.h>
             void test() {
-              //TODO: test if sharp works.    
+              //TODO: test if sharp works. 
             }
             '''))
     except (CompileError, LinkError):
@@ -208,9 +217,9 @@ def get_sharp_dir(build_ext):
             'Please specify correct SHARP location via HOROVOD_SHARP_HOME '
             'environment variable or combination of HOROVOD_SHARP_INCLUDE and '
             'HOROVOD_SHARP_LIB environment variables.\n\n'
-            'HOROVOD_SHARP_HOME - path where NCCL include and lib directories can be found\n'
-            'HOROVOD_SHARP_INCLUDE - path to NCCL include directory\n'
-            'HOROVOD_SHARP_LIB - path to NCCL lib directory')
+            'HOROVOD_SHARP_HOME - path where SHARP include and lib directories can be found\n'
+            'HOROVOD_SHARP_INCLUDE - path to SHARP include directory\n'
+            'HOROVOD_SHARP_LIB - path to SHARP lib directory')
 
     return sharp_include_dirs, sharp_lib_dirs
 
@@ -301,8 +310,9 @@ def fully_define_extension(build_ext):
         nccl_include_dirs = nccl_lib_dirs = []
 
     if node_allreduce == 'SHARP':
+        print("-------------------------------------\nAdding SHARP\n------------------------------------")
         have_sharp = True
-        sharp_include_dirs, sharp_lib_dirs = get_sharp_dirs(build_ext)
+        sharp_include_dirs, sharp_lib_dirs = get_sharp_dir(build_ext)
     else:
         have_sharp = False
         sharp_include_dirs = sharp_lib_dirs = []
@@ -336,7 +346,7 @@ def fully_define_extension(build_ext):
         MACROS += [('HAVE_SHARP', '1')]
         INCLUDES += sharp_include_dirs
         LIBRARY_DIRS += sharp_lib_dirs
-        LIBRARIES = ['sharp']
+        LIBRARIES = ['sharp_coll']
 
 
     if gpu_allreduce:
