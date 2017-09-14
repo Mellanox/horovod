@@ -66,12 +66,18 @@ public:
   int32_t device() const;
   void set_device(int32_t value);
 
+  uint16_t idx() const;
+  void set_idx(uint16_t value);
+
+
   const std::vector<int64_t>& tensor_shape() const;
   void set_tensor_shape(const std::vector<int64_t>& value);
   void add_tensor_shape(int64_t value);
 
   static void ParseFromString(MPIRequest& request, const std::string& input);
   static void SerializeToString(MPIRequest& request, std::string& output);
+
+  
 
 private:
   int32_t request_rank_;
@@ -81,6 +87,8 @@ private:
   int32_t device_;
   std::string tensor_name_;
   std::vector<int64_t> tensor_shape_;
+  uint16_t idx_;
+
 };
 
 // An MPIResponse is a message sent from the coordinator (rank zero) to a rank

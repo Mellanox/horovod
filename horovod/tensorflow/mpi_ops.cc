@@ -34,7 +34,7 @@
 #endif
 
 #if HAVE_SHARP
-#include  <sharp.h>
+#include  <sharp/api/sharp.h>
 #endif
 
 #define OMPI_SKIP_MPICXX
@@ -42,16 +42,6 @@
 #include "mpi.h"
 #include "mpi_message.h"
 #include "timeline.h"
-
-
-//#define HAVE_SHARP
-
-
-
-
-
-
-
 
 /*
  * Allreduce, Allgather and Broadcast Ops for TensorFlow.
@@ -210,6 +200,11 @@ struct HorovodGlobalState {
 #if HAVE_NCCL
   std::unordered_map<std::vector<int32_t>, ncclComm_t> nccl_comms;
 #endif
+#ifdef HAVE_SHARP
+  size_t sharp_thresh;
+  std::mutex sharp_mutex;
+  std::queue<MPIRequest*> sharp_queue;
+#endif
 
 // We reuse CUDA events as it appears that their creation carries non-zero cost.
 // Event management code is only used in NCCL path.
@@ -307,7 +302,7 @@ MPIResponse ConstructMPIResponse(std::unique_ptr<MessageTable>& message_table,
   auto message_type = requests[0].request_type();
   for (unsigned int i = 1; i < requests.size(); i++) {
     if (error) {
-      break;
+      break;;
     }
 
     auto request_type = requests[i].request_type();
@@ -1253,9 +1248,36 @@ void CheckForStalledTensors(HorovodGlobalState& state) {
 //      response from the coordinator. At that point, the tick ends.
 //      If instead of "DONE" they receive "SHUTDOWN", they exit their background
 //      loop.
+
+#ifdef HAVE_SHARP
+int Local_Allreduce(){
+
+
+
+}
+
+
+int Do_Sharp(){
+
+
+
+
+
+
+
+
+
+
+}
+#endif
+
+
+
+
 void BackgroundThreadLoop(HorovodGlobalState& state) {
   // Initialize MPI. This must happen on the background thread, since not all
   // MPI implementations support being called from multiple threads.
+
   MPI_Init(NULL, NULL);
 
   // Get MPI rank to determine if we are rank zero.
@@ -1266,6 +1288,8 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   // Get MPI size to determine how many tensors to wait for before reducing.
   int size;
   MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+  printf("Comm size = %d\n", size);
 
   // Determine local rank by querying the local communicator.
   MPI_Comm local_comm;
@@ -1278,11 +1302,6 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   state.local_rank = local_rank;
   state.size = size;
   state.initialization_done = true;
-
-#ifdef HAVE_SHARP
-  printf("HAVE SHARP is defined!\n");
-#endif
-
 
   // Open the timeline file on coordinator.
   auto horovod_timeline = std::getenv("HOROVOD_TIMELINE");
@@ -1525,23 +1544,92 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
 }
 
 
+#if HAVE_SHARP
 
-void InitSharp(){
-
-
-
+static int oob_bcast(void *comm_context, void *buf, int size, int root)
+{
+        return 0;
 }
 
+static int oob_barrier(void *comm_context)
+{
+        return 0;
+}
+
+static int oob_gather(void *comm_context, int root, void *sbuf, void *rbuf, int len)
+{
+        memcpy(rbuf, sbuf, len);
+        return 0;
+}
+
+static char *get_host_name(void)
+{
+    static char hostname[256] = {0};
+
+    if (*hostname == 0) {
+        gethostname(hostname, sizeof(hostname));
+        strtok(hostname, ".");
+    }
+    return hostname;
+}
+
+int InitSharp(){
+  int ret = 0, rc;
+  struct sharp_coll_init_spec init_spec = {0};
+  struct sharp_coll_context *sharp_coll_context;
+  struct sharp_coll_comm *sharp_coll_comm;
+  struct sharp_coll_comm_init_spec comm_spec;
+  struct timeval tval;
+  init_spec.progress_func  = NULL;
+  /* coverity[dont_call] */
+  init_spec.job_id = (gethostid() << 32) | rand();
+  init_spec.hostlist = get_host_name();
+  init_spec.world_rank = 0;
+  init_spec.world_size = 1;
+  init_spec.oob_colls.barrier = oob_barrier;
+  init_spec.oob_colls.bcast = oob_bcast;
+  init_spec.oob_colls.gather = oob_gather;
+  init_spec.config = sharp_coll_default_config;
+  init_spec.config.ib_dev_list = "mlx5_1";  
+  /* initialize sharp coll */
+  
+  ret = sharp_coll_init(&init_spec, &sharp_coll_context);
+  if (ret < 0) {
+    fprintf(stderr, "sharp_coll_init failed: %s\n", sharp_coll_strerror(ret));
+    return ret;
+  }
+  /* create sharp group */
+  comm_spec.rank = 0;
+  comm_spec.size = 1;
+  comm_spec.is_comm_world = 1;
+  comm_spec.oob_ctx = NULL;
+  ret = sharp_coll_comm_init(sharp_coll_context, &comm_spec, &sharp_coll_comm);
+  if (ret < 0) {
+    fprintf(stderr, "sharp communicator creation failed: %s\n", sharp_coll_strerror(ret));
+    sharp_coll_finalize(sharp_coll_context);
+    return ret;
+  }
+  /* destroy group */
+  sharp_coll_comm_destroy(sharp_coll_comm);
+  sharp_coll_finalize(sharp_coll_context);
+  return ret;
+}
+
+#endif
 
 // Start Horovod background thread. Ensure that this is
 // only done once no matter how many times this function is called.
 void InitializeHorovodOnce() {
   // Ensure background thread is only started once.
   if (!horovod_global.initialize_flag.test_and_set()) {
+#if HAVE_SHARP
+    int ret;
+    ret = InitSharp();
+    horovod_global.sharp_thresh = ((ret>=0)?256:0);
+#endif
     horovod_global.background_thread =
         std::thread(BackgroundThreadLoop, std::ref(horovod_global));
   }
-
   // Wait to ensure that the background thread has finished initializing MPI.
   while (!horovod_global.initialization_done) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1658,6 +1746,69 @@ void EnqueueTensorAllreduce(OpKernelContext* context, const Tensor& tensor,
   horovod_global.tensor_table.emplace(name, std::move(e));
   horovod_global.message_queue.push(message);
 }
+
+#ifdef HAVE_SHARP
+
+void EnqueueTensorSharpAllreduce(OpKernelContext* context, const Tensor& tensor,
+                            Tensor* output, const int32_t& idx  , GPU_EVENT_IF_CUDA ready_event,
+                            const std::string name, const int device,
+                            StatusCallback callback) {
+  MPIDataType dtype;
+  Status status = DataTypeToMPIType(tensor.dtype(), &dtype);
+  if (!status.ok()) {
+    callback(status);
+    return;
+  }
+  int rank;  
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+  MPIRequest* message = new MPIRequest();
+  message->set_request_rank(rank);
+  message->set_tensor_name(name);
+  message->set_tensor_type(dtype);
+  message->set_device(device);
+  message->set_request_type(MPIRequest::ALLREDUCE);
+  message->set_idx((uint16_t) idx);
+  for (int i = 0; i < tensor.shape().dims(); i++) {
+    message->add_tensor_shape(tensor.shape().dim_size(i));
+  }
+
+  TensorTableEntry e;
+  e.tensor_name = name;
+  e.context = context;
+  e.tensor = tensor;
+  e.output = output;
+  e.ready_event = ready_event;
+  e.device = device;
+  e.callback = callback;
+
+  std::lock_guard<std::mutex> guard(horovod_global.sharp_mutex);
+  horovod_global.tensor_table.emplace(name, std::move(e));
+  horovod_global.sharp_queue.push(message);
+}
+#endif
+
+// MPI must be initialized and the background thread must be running before
+// this function is called.
+void EnqueueTensorAllreduce2(OpKernelContext* context, const Tensor& tensor, 
+                            Tensor* output, const int32_t& idx  , GPU_EVENT_IF_CUDA ready_event,
+                            const std::string name, const int device,
+                            StatusCallback callback) {
+
+#ifdef HAVE_SHARP
+  if (horovod_global.sharp_thresh > tensor.tensor_data().size() 
+  {
+    EnqueueTensorSharpAllreduce(context,tensor,output, idx ,ready_event,name,device,callback);
+  } 
+  else 
+#endif
+  {
+    EnqueueTensorAllreduce(context,tensor,output,ready_event,name,device,callback);
+  }
+  return;
+}
+
+
 
 // MPI must be initialized and the background thread must be running before
 // this function is called.
@@ -1800,6 +1951,66 @@ REGISTER_KERNEL_BUILDER(Name("HorovodAllreduce").Device(DEVICE_GPU),
 
 REGISTER_OP("HorovodAllreduce")
     .Attr("T: {int32, int64, float32, float64}")
+    .Input("tensor: T")
+    .Output("sum: T")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->input(0));
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Perform an MPI Allreduce on a tensor. All other processes that do a reduction
+on a tensor with the same name must have the same dimension for that tensor.
+Tensors are reduced with other tensors that have the same node name for the
+allreduce.
+
+Arguments
+    tensor:     A tensor to reduce.
+
+Output
+    sum:    A tensor with the same shape as `tensor`, summed across all MPI processes.
+)doc");
+
+class HorovodAllreduce2Op : public AsyncOpKernel {
+public:
+  explicit HorovodAllreduce2Op(OpKernelConstruction* context)
+      : AsyncOpKernel(context) 
+  {
+    OP_REQUIRES_OK(context,context->GetAttr("idx",&idx));
+  }
+
+  void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
+    OP_REQUIRES_OK(context, CheckInitialized());
+
+    auto node_name = name();
+    auto device = GetDeviceID(context);
+    auto tensor = context->input(0);
+
+    Tensor* output;
+    OP_REQUIRES_OK(context,
+                   context->allocate_output(0, tensor.shape(), &output));
+    GPU_EVENT_IF_CUDA ready_event = RecordReadyEvent(context);
+    EnqueueTensorAllreduce2(context, tensor, output, idx , ready_event, node_name,
+                           device, [context, done](const Status& status) {
+                             context->SetStatus(status);
+                             done();
+                           });
+  }
+
+private:
+  int32_t idx;
+
+};
+
+REGISTER_KERNEL_BUILDER(Name("HorovodAllreduce2").Device(DEVICE_CPU),
+                        HorovodAllreduce2Op);
+#if HOROVOD_GPU_ALLREDUCE
+REGISTER_KERNEL_BUILDER(Name("HorovodAllreduce2").Device(DEVICE_GPU),
+                        HorovodAllreduce2Op);
+#endif
+
+REGISTER_OP("HorovodAllreduce2")
+    .Attr("T: {int32, int64, float32, float64}")
+    .Attr("idx: int")
     .Input("tensor: T")
     .Output("sum: T")
     .SetShapeFn([](shape_inference::InferenceContext* c) {

@@ -98,6 +98,12 @@ int32_t MPIRequest::device() const { return device_; }
 
 void MPIRequest::set_device(int32_t value) { device_ = value; }
 
+uint16_t MPIRequest::idx() const { return idx_; }
+
+void MPIRequest::set_idx(uint16_t value) { idx_ = value; }
+
+
+
 const std::vector<int64_t>& MPIRequest::tensor_shape() const {
   return tensor_shape_;
 }
