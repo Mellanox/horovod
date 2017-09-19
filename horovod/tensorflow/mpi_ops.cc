@@ -35,13 +35,18 @@
 
 #if HAVE_SHARP
 #include  <sharp/api/sharp.h>
+#include "buffer_bank.h"
 #endif
 
 #define OMPI_SKIP_MPICXX
 #include "hash_vector.h"
 #include "mpi.h"
 #include "mpi_message.h"
+#include "AllReduceVector.h"
 #include "timeline.h"
+#include <bitset>
+
+#define GET_ROOT 0
 
 /*
  * Allreduce, Allgather and Broadcast Ops for TensorFlow.
@@ -203,8 +208,12 @@ struct HorovodGlobalState {
 #ifdef HAVE_SHARP
   size_t sharp_thresh;
   std::mutex sharp_mutex;
-  std::queue<MPIRequest*> sharp_queue;
   ncclComm_t nccl_local_comm;
+  AllReduceVector vec;
+  std::mutex local_mutex;
+  std::queue<MPIRequest*> locally_reduced_queue;
+  BufferBank bank;
+  int root_reducer;
 #endif
 
 // We reuse CUDA events as it appears that their creation carries non-zero cost.
@@ -552,6 +561,19 @@ Status GetNCCLDataType(const Tensor tensor, ncclDataType_t* dtype) {
     }                                                                          \
   }
 
+
+#define MPI_CHECK1(entry, op_name, op)                                         \
+  {                                                                            \
+    auto mpi_result = (op);                                                    \
+    if (mpi_result != MPI_SUCCESS) {                                           \
+      timeline.End(entry.tensor_name, nullptr);                                \
+      entry.callback(                                                          \
+          errors::Unknown(op_name, " failed, see MPI output for details."));   \
+      return;                                                                  \
+    }                                                                          \
+  }
+
+
 #define CUDA_CHECK(entries, op_name, op)                                       \
   {                                                                            \
     auto cuda_result = (op);                                                   \
@@ -565,6 +587,19 @@ Status GetNCCLDataType(const Tensor tensor, ncclDataType_t* dtype) {
     }                                                                          \
   }
 
+#define CUDA_CHECK1(entry, op_name, op)                                        \
+  {                                                                            \
+    auto cuda_result = (op);                                                   \
+    if (cuda_result != cudaSuccess) {                                          \
+      timeline.End(entry.tensor_name, nullptr);                                \
+      entry.callback(errors::Unknown(                                          \
+          op_name, " failed: ", cudaGetErrorString(cuda_result)));             \
+      return;                                                                  \
+    }                                                                          \
+  }
+
+
+
 #define NCCL_CHECK(entries, op_name, op)                                       \
   {                                                                            \
     auto nccl_result = (op);                                                   \
@@ -574,6 +609,17 @@ Status GetNCCLDataType(const Tensor tensor, ncclDataType_t* dtype) {
         it->callback(errors::Unknown(                                          \
             op_name, " failed: ", ncclGetErrorString(nccl_result)));           \
       }                                                                        \
+      return;                                                                  \
+    }                                                                          \
+  }
+
+#define NCCL_CHECK1(entry, op_name, op)                                        \
+  {                                                                            \
+    auto nccl_result = (op);                                                   \
+    if (nccl_result != ncclSuccess) {                                          \
+      timeline.End(entry.tensor_name, nullptr);                                  \
+      entry.callback(errors::Unknown(                                            \
+          op_name, " failed: ", ncclGetErrorString(nccl_result)));             \
       return;                                                                  \
     }                                                                          \
   }
@@ -634,12 +680,18 @@ cudaError_t ReleaseCudaEvent(cudaEvent_t event) {
     }                                                                          \
   }
 
+#define ACTIVITY_START_ONE(entry, timeline, activity)  timeline.ActivityStart(entry.tensor_name, activity);
+
+
 #define ACTIVITY_END_ALL(entries, timeline)                                    \
   {                                                                            \
     for (auto it = entries.begin(); it != entries.end(); it++) {               \
       timeline.ActivityEnd(it->tensor_name);                                   \
     }                                                                          \
   }
+
+#define ACTIVITY_END_ONE(entry, timeline)  timeline.ActivityEnd(entry.tensor_name);
+
 
 // Process an MPIResponse by doing a reduction, a gather, a broadcast, or
 // raising an error.
@@ -1251,9 +1303,9 @@ void CheckForStalledTensors(HorovodGlobalState& state) {
 //      loop.
 
 #ifdef HAVE_SHARP
-int Local_Allreduce(TensorTable& tensor_table, MPIResponse* response, MPI_Comm& local_comm){
+int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& local_comm, BufferBank& bank, int rank, uint16_t idx){
   //Perform_Operation
-  std::vector<TensorTableEntry> entries;
+  TensorTableEntry entry;
   {
     // Lock on the tensor table.
     std::lock_guard<std::mutex> guard(horovod_global.mutex);
@@ -1270,88 +1322,100 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse* response, MPI_Comm& 
              response.response_type() == MPIResponse::BROADCAST ||
              response.response_type() == MPIResponse::ERROR);
 
-      entries.push_back(iter->second);
+      entry = iter->second;
       //tensor_table.erase(iter);
     }
   }
 
 
-  auto first_entry = entries[0];
 #if HAVE_CUDA
-  bool on_gpu = first_entry.device != CPU_DEVICE_ID;
+  bool on_gpu = entry.device != CPU_DEVICE_ID;
   if (on_gpu) {
-    CUDA_CHECK(entries, "cudaSetDevice", cudaSetDevice(first_entry.device))
+    CUDA_CHECK1(entry, "cudaSetDevice", cudaSetDevice(entry.device))
     // Ensure stream is in the map before executing reduction.
-    cudaStream_t& stream = horovod_global.streams[first_entry.device];
+    cudaStream_t& stream = horovod_global.streams[entry.device];
     if (stream == nullptr) {
-      CUDA_CHECK(entries, "cudaStreamCreate", cudaStreamCreate(&stream))
+      CUDA_CHECK1(entry, "cudaStreamCreate", cudaStreamCreate(&stream))
     }
   }
 #endif
 
 #if HOROVOD_GPU_ALLREDUCE == 'N' // 'N' stands for NCCL
     if (on_gpu) {
-      auto stream = horovod_global.streams[first_entry.device];
+      auto stream = horovod_global.streams[entry.device];
 
       // Ensure NCCL communicator is in the map before executing reduction.
       ncclComm_t& nccl_comm = nccl_local_comm;
       if (nccl_comm == nullptr) {
-        ACTIVITY_START_ALL(entries, timeline, "INIT_LOCAL_NCCL")
+        timeline.ActivityStart(entry.tensor_name, "INIT_LOCAL_NCCL");     
+
 
         ncclUniqueId nccl_id;
         if (horovod_global.rank == 0) {
-          NCCL_CHECK(entries, "ncclGetUniqueId", ncclGetUniqueId(&nccl_id))
+          NCCL_CHECK1(entry, "ncclGetUniqueId", ncclGetUniqueId(&nccl_id))
         }
 
-        MPI_CHECK(entries, "MPI_Bcast",
+        MPI_CHECK1(entry, "MPI_Bcast",
                   MPI_Bcast((void*)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0,
                            local_comm));
 
-        NCCL_CHECK(entries, "ncclCommInitRank",
+        NCCL_CHECK1(entry, "ncclCommInitRank",
                    ncclCommInitRank(&nccl_comm, horovod_global.size, nccl_id,
                                     horovod_global.rank))
 
         // TODO: Rohit (NVIDIA): figure out why we need this sleep
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
-        ACTIVITY_END_ALL(entries, timeline)
+        ACTIVITY_END_ONE(entry, timeline)
       }
 
       ncclDataType_t dtype;
-      status = GetNCCLDataType(first_entry.tensor, &dtype);
+      status = GetNCCLDataType(entry.tensor, &dtype);
       if (!status.ok()) {
-        for (auto it = entries.begin(); it != entries.end(); it++) {
-          timeline.End(it->tensor_name, nullptr);
-          it->callback(status);
-        }
+        timeline.End(entry.tensor_name, nullptr);
+        entry.callback(status);
         return;
       }
 
-      ACTIVITY_START_ALL(entries, timeline, "SCHEDULE")
+      ACTIVITY_START_ONE(entry, timeline, "SCHEDULE")
 
       cudaEvent_t queue_end_event = nullptr;
       if (timeline.Initialized()) {
-        RECORD_EVENT(entries, queue_end_event, stream);
+        CUDA_CHECK1(entry, "GetCudaEvent", GetCudaEvent(&queue_end_event))
+        CUDA_CHECK1(entry, "cudaEventRecord", cudaEventRecord(event, stream))
       }
 
       cudaEvent_t after_reduce_event = nullptr;
 
-      NCCL_CHECK(entries, "ncclAllReduce",
-                 ncclAllReduce((const void*)fisrt_entry.tensor.tensor_data().data(),
-                               (void*)first_entry.output->tensor_data().data(),
-                               (size_t)first_entry.tensor.NumElements(), dtype, ncclSum,
-                               nccl_comm, stream))
+
+      int root = GET_ROOT;
+
+
+      void* dest = (rank == root)? bank.request(idx) : NULL ;
+
+      NCCL_CHECK1(entry, "ncclAllReduce",
+                 ncclReduce((const void*) entry.tensor.tensor_data().data(),
+                               dest,
+                               (size_t) entry.tensor.NumElements(), dtype, ncclSum,
+                               root ,nccl_comm, stream))
+
+
+
       if (timeline.Initialized()) {
-        RECORD_EVENT(entries, after_reduce_event, stream)
+        CUDA_CHECK1(entry, "GetCudaEvent", GetCudaEvent(&after_reduce_event))
+        CUDA_CHECK1(entry, "cudaEventRecord", cudaEventRecord(event, stream))
       }
 
-      ACTIVITY_END_ALL(entries, timeline)
-      ACTIVITY_START_ALL(entries, timeline, "QUEUE")
+      ACTIVITY_END_ONE(entry, timeline)
+      ACTIVITY_START_ONE(entry, timeline, "QUEUE")
 
       // Use completion marker via event because it's faster than
       // blocking cudaStreamSynchronize() in this thread.
       cudaEvent_t done_event;
       RECORD_EVENT(entries, done_event, stream)
+
+
+
 
       // TODO: use thread pool or single thread for callbacks
       std::thread finalizer_thread([entries, first_entry, done_event,
@@ -1381,6 +1445,7 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse* response, MPI_Comm& 
                    cudaEventSynchronize(done_event))
         for (auto it = entries.begin(); it != entries.end(); it++) {
           timeline.End(it->tensor_name, it->output);
+          
           //it->callback(Status::OK());  //TODO: Post_Sharp!
         }
         RELEASE_EVENT(entries, done_event);
@@ -1432,98 +1497,50 @@ int Do_Sharp(HorovodGlobalState& state) {
   state.message_table = std::unique_ptr<MessageTable>(new MessageTable());
 
 
+  AllReduceVector& vec = global.vec;
+
+  int32_t bsize = vec.size();
   bool dev_init = false;
   std::vector<int32_t> devices(size);
-  std::queue<MPIRequest*> sharp_pending_local_reduce;
   do {
 
-
-    //// Check Sharp Queue And locally allreduce the tensors  
+    //// Check Sharp Queue And sync locally
     {
       std::lock_guard<std::mutex> guard(state.sharp_mutex);
-      while (!state.sharp_queue.empty()){
-        MPIRequest* req =  state.sharp_queue.front();
-        state.sharp_queue.pop();
-        sharp_pending_local_reduce.insert(req);
-      }
+      vec.addAll();
     }
 
-    
-
-    memcpy(bufcopy,vec.buf(),bsize);
-    MPI_Allreduce((void*) bufcopy, (void*) reduceBuf,
+    //memcpy(bufcopy,vec.buf(),bsize);
+    MPI_Allreduce((void*) vec.buf, (void*) reduceBuf,
                               bsize, MPI_CHAR, MPI_BAND,
-                              MPI_COMM_WORLD);
+                              local_comm;
+
     vec.check(reduceBuf);
-    if (vec.num_ready()==0){
-      std::this_thread::sleep_for(std::chrono::milliseconds(15));
-    }
-    std::vector<MPIResponse> responses;
-    while (vec.num_ready()>0) {
-      // Pop the first available message message 
-      MPIRequest* message = vec.pop();
-      IncrementTensorCount(state.message_table, (*message), size);
-      MPIResponse response;
-      auto name = message->tensor_name();       
-      response.add_tensor_names(name);
-      auto message_type = message->request_type();
-      if (message_type == MPIRequest::ALLGATHER) {
-        response.set_response_type(MPIResponse::ALLGATHER);
-      } else if (message_type == MPIRequest::ALLREDUCE) {
-        response.set_response_type(MPIResponse::ALLREDUCE);
-      } else if (message_type == MPIRequest::BROADCAST) {
-        response.set_response_type(MPIResponse::BROADCAST);
+
+    //// Locally allreduce the tensors
+    {
+      while (vec.num_ready()>0){
+        MPIRequest* req =  vec.pop();
+        IncrementTensorCount(state.message_table, (*message), size);
+        MPIResponse response;
+        auto name = message->tensor_name();
+        response.add_tensor_names(name);
+        auto message_type = message->request_type();
+	if (message_type == MPIRequest::ALLGATHER) {
+	  response.set_response_type(MPIResponse::ALLGATHER);
+	} else if (message_type == MPIRequest::ALLREDUCE) {
+	  response.set_response_type(MPIResponse::ALLREDUCE);
+	} else if (message_type == MPIRequest::BROADCAST) {
+	  response.set_response_type(MPIResponse::BROADCAST);
+	}
+        Local_Allreduce(state.message_table, response, local_comm, state.bank, local_rank, message->idx());
+        free(message);
       }
-      if (!dev_init) {
-        for (int k =0; k < size; ++k){
-          int dev;
-          if (k == rank){
-            dev = message->device();
-          }
-          MPI_Bcast(&dev, 1, MPI_INT, k, MPI_COMM_WORLD);
-          devices[k] = dev;
-        }
-        dev_init = true;
-      }
-      response.set_devices(devices);
-      free(message);
-      responses.push_back(std::move(response));
-    }
-    while (!responses.empty()) {
-      auto it = responses.begin();
-      MPIResponse response = *it;
-      assert(response.tensor_names().size() == 1);
-      it = responses.erase(it);
-      if (response.response_type() == MPIResponse::ResponseType::ALLREDUCE) {
-        // Attempt to add more responses to this fused response.
-        auto& entry = state.tensor_table[response.tensor_names()[0]];
-        size_t tensor_size = entry.tensor.tensor_data().size();
-        while (it != responses.end()) {
-          assert(it->tensor_names().size() == 1);
-          auto& new_entry = state.tensor_table[it->tensor_names()[0]];
-          size_t new_tensor_size = new_entry.tensor.tensor_data().size();
-          if (response.response_type() == it->response_type() &&
-              response.devices() == it->devices() &&
-              entry.tensor.dtype() == new_entry.tensor.dtype() &&
-              tensor_size + new_tensor_size <=
-                  state.tensor_fusion_threshold) {
-            // These tensors will fuse together well.
-            tensor_size += new_tensor_size;
-            response.add_tensor_names(it->tensor_names()[0]);
-            it = responses.erase(it);
-          } else {
-            // Don't try to fuse additional tensors since they are usually
-            // computed in order of requests and skipping tensors may mean
-            // that the batch will have to wait longer while skipped tensors
-            // could be reduced at that time.
-            break;
-          }
-        }
-      }
-      PerformOperation(state.tensor_table, response); 
     }
 
-    if (state.shut_down) vec.markLast();
+
+
+    //if (state.shut_down) vec.markLast();
   } while (!vec.isLast());
 
 }
@@ -2040,7 +2057,8 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, const Tensor& tensor,
 
   std::lock_guard<std::mutex> guard(horovod_global.sharp_mutex);
   horovod_global.tensor_table.emplace(name, std::move(e));
-  horovod_global.sharp_queue.push(message);
+  //horovod_global.sharp_queue.push(message);
+  horovod_global.vec.insert(idx,message);
 }
 #endif
 

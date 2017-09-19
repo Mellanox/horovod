@@ -321,7 +321,9 @@ def fully_define_extension(build_ext):
     INCLUDES = tf_include_dirs
     SOURCES = ['horovod/tensorflow/mpi_message.cc',
                'horovod/tensorflow/mpi_ops.cc',
-               'horovod/tensorflow/timeline.cc']
+               'horovod/tensorflow/timeline.cc',
+               'horovod/tensorflow/AllReduceVector.cc]',
+               'horovod/tensorflow/buffer_bank.cc]'
     COMPILE_FLAGS = ['-std=c++11', '-fPIC', '-O2'] + shlex.split(mpi_flags)
     LINK_FLAGS = shlex.split(mpi_flags)
     LIBRARY_DIRS = tf_lib_dirs
