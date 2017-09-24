@@ -137,12 +137,16 @@ public:
   static void ParseFromString(MPIResponse& response, const std::string& input);
   static void SerializeToString(MPIResponse& response, std::string& output);
 
+  const uint16_t idx() const;
+  void set_idx(uint16_t idx);
+
 private:
   ResponseType response_type_;
   std::vector<std::string> tensor_names_;
   std::string error_message_;
   std::vector<int32_t> devices_;
   std::vector<int64_t> tensor_sizes_;
+  uint16_t idx_;
 };
 
 } // namespace tensorflow

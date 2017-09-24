@@ -221,6 +221,15 @@ void MPIResponse::add_tensor_sizes(int64_t value) {
   tensor_sizes_.push_back(value);
 }
 
+const uint16_t MPIResponse::idx() const{
+  return idx_;
+}
+
+
+void MPIResponse::set_idx(uint16_t idx){
+  idx_ = idx;
+}
+
 void MPIResponse::ParseFromString(MPIResponse& response,
                                   const std::string& input) {
   auto obj = flatbuffers::GetRoot<wire::MPIResponse>((uint8_t*)input.c_str());

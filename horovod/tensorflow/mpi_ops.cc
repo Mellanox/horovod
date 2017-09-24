@@ -122,7 +122,18 @@ typedef struct {
   // A callback to call with the status.
   StatusCallback callback;
 } TensorTableEntry;
+
+typedef struct {
+  TensorTableEntry table_entry;
+  cudaEvent_t event; 
+} EventTableEntry;
+
+
 typedef std::unordered_map<std::string, TensorTableEntry> TensorTable;
+typedef std::map<uint16_t , TensorTableEntry> TensorIdxTable;
+typedef std::map<uint16_t , EventTableEntry> EventTable;
+
+
 
 // Table for storing Tensor metadata on rank zero. This is used for error
 // checking, stall checking and size calculations, as well as determining
@@ -214,6 +225,10 @@ struct HorovodGlobalState {
   std::queue<MPIRequest*> locally_reduced_queue;
   BufferBank bank;
   int root_reducer;
+  TensorIdxTable local_sync_table;
+  EventTable nccl_table;
+  TensorIdxTable sharp_table;
+
 #endif
 
 // We reuse CUDA events as it appears that their creation carries non-zero cost.
@@ -1308,23 +1323,20 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& 
   TensorTableEntry entry;
   {
     // Lock on the tensor table.
-    std::lock_guard<std::mutex> guard(horovod_global.mutex);
+    std::lock_guard<std::mutex> guard(horovod_global.sharp_mutex);
 
-    for (auto it = response.tensor_names().begin();
-         it != response.tensor_names().end(); it++) {
-      // We should never fail at finding this key in the tensor table.
-      auto name = *it;
-      auto iter = tensor_table.find(name);
-      assert(iter != tensor_table.end());
+    auto idx = response.idx();
 
-      assert(response.response_type() == MPIResponse::ALLREDUCE ||
-             response.response_type() == MPIResponse::ALLGATHER ||
-             response.response_type() == MPIResponse::BROADCAST ||
-             response.response_type() == MPIResponse::ERROR);
+    auto iter = local_sync_table.find(idx);
+    assert(iter! = local_sync_table.end());
 
-      entry = iter->second;
-      //tensor_table.erase(iter);
-    }
+    assert(response.response_type() == MPIResponse::ALLREDUCE ||
+           response.response_type() == MPIResponse::ALLGATHER ||
+           response.response_type() == MPIResponse::BROADCAST ||
+           response.response_type() == MPIResponse::ERROR);
+
+    entry = iter->second;
+    local_sync_table.erase(iter);
   }
 
 
@@ -1399,8 +1411,6 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& 
                                (size_t) entry.tensor.NumElements(), dtype, ncclSum,
                                root ,nccl_comm, stream))
 
-
-
       if (timeline.Initialized()) {
         CUDA_CHECK1(entry, "GetCudaEvent", GetCudaEvent(&after_reduce_event))
         CUDA_CHECK1(entry, "cudaEventRecord", cudaEventRecord(event, stream))
@@ -1414,10 +1424,14 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& 
       cudaEvent_t done_event;
       RECORD_EVENT(entries, done_event, stream)
 
+      EventTableEntry event_entry;
+      event_entry.event = done_event; 
+      event_entry.table_entry = entry;
 
-
+      horovod_global.nccl_table.emplace(idx, std::move(event_entry));
 
       // TODO: use thread pool or single thread for callbacks
+#if 0
       std::thread finalizer_thread([entries, first_entry, done_event,
                                     queue_end_event, 
                                     after_reduce_event, 
@@ -1450,7 +1464,9 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& 
         }
         RELEASE_EVENT(entries, done_event);
       });
+
       finalizer_thread.detach();
+#endif
       return;
     }
 #endif
@@ -1465,11 +1481,20 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& 
       return;
     }
 //PerformOperation
-
-
-
-
 }
+
+bool Progress_Nccl{
+  for (EventTable::iterator it = horovod_global.nccl_table.begin(); it != horovod_global.nccl_table.end();){
+    cudaEvent_t& done_event = it->second.event;
+    if (cudaEventQuery(done_event) == cudaSuccess){
+      horovod_global.sharp_table.emplace();
+      it = horovod_global.nccl_table.erase(it);
+    } else {
+      ++it;
+    }
+  } 
+}
+
 
 int Do_Sharp(HorovodGlobalState& state) {
   // Initialize MPI. This must happen on the background thread, since not all
@@ -2056,8 +2081,7 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, const Tensor& tensor,
   e.callback = callback;
 
   std::lock_guard<std::mutex> guard(horovod_global.sharp_mutex);
-  horovod_global.tensor_table.emplace(name, std::move(e));
-  //horovod_global.sharp_queue.push(message);
+  horovod_global.local_sync_table.emplace(idx, std::move(e));
   horovod_global.vec.insert(idx,message);
 }
 #endif
