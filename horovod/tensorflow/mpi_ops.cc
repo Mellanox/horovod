@@ -124,13 +124,13 @@ typedef struct {
 } TensorTableEntry;
 
 typedef struct {
-  TensorTableEntry table_entry;
+  TensorTableEntry* table_entry;
   cudaEvent_t event; 
 } EventTableEntry;
 
 
 typedef std::unordered_map<std::string, TensorTableEntry> TensorTable;
-typedef std::map<uint16_t , TensorTableEntry> TensorIdxTable;
+typedef std::map<uint16_t , TensorTableEntry*> TensorIdxTable;
 typedef std::map<uint16_t , EventTableEntry> EventTable;
 
 
@@ -228,7 +228,9 @@ struct HorovodGlobalState {
   TensorIdxTable local_sync_table;
   EventTable nccl_table;
   TensorIdxTable sharp_table;
-
+  int local_size = 1;
+  struct sharp_coll_context *sharp_coll_context;
+  struct sharp_coll_comm *sharp_coll_comm;
 #endif
 
 // We reuse CUDA events as it appears that their creation carries non-zero cost.
@@ -581,8 +583,8 @@ Status GetNCCLDataType(const Tensor tensor, ncclDataType_t* dtype) {
   {                                                                            \
     auto mpi_result = (op);                                                    \
     if (mpi_result != MPI_SUCCESS) {                                           \
-      timeline.End(entry.tensor_name, nullptr);                                \
-      entry.callback(                                                          \
+      timeline.End(entry->tensor_name, nullptr);                                \
+      entry->callback(                                                          \
           errors::Unknown(op_name, " failed, see MPI output for details."));   \
       return;                                                                  \
     }                                                                          \
@@ -606,8 +608,8 @@ Status GetNCCLDataType(const Tensor tensor, ncclDataType_t* dtype) {
   {                                                                            \
     auto cuda_result = (op);                                                   \
     if (cuda_result != cudaSuccess) {                                          \
-      timeline.End(entry.tensor_name, nullptr);                                \
-      entry.callback(errors::Unknown(                                          \
+      timeline.End(entry->tensor_name, nullptr);                                \
+      entry->callback(errors::Unknown(                                          \
           op_name, " failed: ", cudaGetErrorString(cuda_result)));             \
       return;                                                                  \
     }                                                                          \
@@ -632,8 +634,8 @@ Status GetNCCLDataType(const Tensor tensor, ncclDataType_t* dtype) {
   {                                                                            \
     auto nccl_result = (op);                                                   \
     if (nccl_result != ncclSuccess) {                                          \
-      timeline.End(entry.tensor_name, nullptr);                                  \
-      entry.callback(errors::Unknown(                                            \
+      timeline.End(entry->tensor_name, nullptr);                                  \
+      entry->callback(errors::Unknown(                                            \
           op_name, " failed: ", ncclGetErrorString(nccl_result)));             \
       return;                                                                  \
     }                                                                          \
@@ -695,7 +697,7 @@ cudaError_t ReleaseCudaEvent(cudaEvent_t event) {
     }                                                                          \
   }
 
-#define ACTIVITY_START_ONE(entry, timeline, activity)  timeline.ActivityStart(entry.tensor_name, activity);
+#define ACTIVITY_START_ONE(entry, timeline, activity)  timeline.ActivityStart(entry->tensor_name, activity);
 
 
 #define ACTIVITY_END_ALL(entries, timeline)                                    \
@@ -705,7 +707,7 @@ cudaError_t ReleaseCudaEvent(cudaEvent_t event) {
     }                                                                          \
   }
 
-#define ACTIVITY_END_ONE(entry, timeline)  timeline.ActivityEnd(entry.tensor_name);
+#define ACTIVITY_END_ONE(entry, timeline)  timeline.ActivityEnd(entry->tensor_name);
 
 
 // Process an MPIResponse by doing a reduction, a gather, a broadcast, or
@@ -1320,7 +1322,7 @@ void CheckForStalledTensors(HorovodGlobalState& state) {
 #ifdef HAVE_SHARP
 int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& local_comm, BufferBank& bank, int rank, uint16_t idx){
   //Perform_Operation
-  TensorTableEntry entry;
+  TensorTableEntry* entry;
   {
     // Lock on the tensor table.
     std::lock_guard<std::mutex> guard(horovod_global.sharp_mutex);
@@ -1341,11 +1343,11 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& 
 
 
 #if HAVE_CUDA
-  bool on_gpu = entry.device != CPU_DEVICE_ID;
+  bool on_gpu = entry->device != CPU_DEVICE_ID;
   if (on_gpu) {
-    CUDA_CHECK1(entry, "cudaSetDevice", cudaSetDevice(entry.device))
+    CUDA_CHECK1(entry, "cudaSetDevice", cudaSetDevice(entry->device))
     // Ensure stream is in the map before executing reduction.
-    cudaStream_t& stream = horovod_global.streams[entry.device];
+    cudaStream_t& stream = horovod_global.streams[entry->device];
     if (stream == nullptr) {
       CUDA_CHECK1(entry, "cudaStreamCreate", cudaStreamCreate(&stream))
     }
@@ -1354,16 +1356,16 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& 
 
 #if HOROVOD_GPU_ALLREDUCE == 'N' // 'N' stands for NCCL
     if (on_gpu) {
-      auto stream = horovod_global.streams[entry.device];
+      auto stream = horovod_global.streams[entry->device];
 
       // Ensure NCCL communicator is in the map before executing reduction.
       ncclComm_t& nccl_comm = nccl_local_comm;
       if (nccl_comm == nullptr) {
-        timeline.ActivityStart(entry.tensor_name, "INIT_LOCAL_NCCL");     
+        timeline.ActivityStart(entry->tensor_name, "INIT_LOCAL_NCCL");     
 
 
         ncclUniqueId nccl_id;
-        if (horovod_global.rank == 0) {
+        if (horovod_global.local_rank == 0) {
           NCCL_CHECK1(entry, "ncclGetUniqueId", ncclGetUniqueId(&nccl_id))
         }
 
@@ -1372,8 +1374,8 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& 
                            local_comm));
 
         NCCL_CHECK1(entry, "ncclCommInitRank",
-                   ncclCommInitRank(&nccl_comm, horovod_global.size, nccl_id,
-                                    horovod_global.rank))
+                   ncclCommInitRank(&nccl_comm, horovod_global.local_size, nccl_id,
+                                    horovod_global.local_rank))
 
         // TODO: Rohit (NVIDIA): figure out why we need this sleep
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -1382,10 +1384,10 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& 
       }
 
       ncclDataType_t dtype;
-      status = GetNCCLDataType(entry.tensor, &dtype);
+      status = GetNCCLDataType(entry->tensor, &dtype);
       if (!status.ok()) {
-        timeline.End(entry.tensor_name, nullptr);
-        entry.callback(status);
+        timeline.End(entry->tensor_name, nullptr);
+        entry->callback(status);
         return;
       }
 
@@ -1406,9 +1408,9 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& 
       void* dest = (rank == root)? bank.request(idx) : NULL ;
 
       NCCL_CHECK1(entry, "ncclAllReduce",
-                 ncclReduce((const void*) entry.tensor.tensor_data().data(),
+                 ncclReduce((const void*) entry->tensor.tensor_data().data(),
                                dest,
-                               (size_t) entry.tensor.NumElements(), dtype, ncclSum,
+                               (size_t) entry->tensor.NumElements(), dtype, ncclSum,
                                root ,nccl_comm, stream))
 
       if (timeline.Initialized()) {
@@ -1459,8 +1461,7 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& 
                    cudaEventSynchronize(done_event))
         for (auto it = entries.begin(); it != entries.end(); it++) {
           timeline.End(it->tensor_name, it->output);
-          
-          //it->callback(Status::OK());  //TODO: Post_Sharp!
+          it->callback(Status::OK());  //TODO: Post_Sharp!
         }
         RELEASE_EVENT(entries, done_event);
       });
@@ -1483,20 +1484,39 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& 
 //PerformOperation
 }
 
-bool Progress_Nccl{
-  for (EventTable::iterator it = horovod_global.nccl_table.begin(); it != horovod_global.nccl_table.end();){
+int Progress_Nccl(HorovodGlobalState& state){
+  int res = 0;
+  for (EventTable::iterator it = state.nccl_table.begin(); it != state.nccl_table.end();){
     cudaEvent_t& done_event = it->second.event;
     if (cudaEventQuery(done_event) == cudaSuccess){
-      horovod_global.sharp_table.emplace();
-      it = horovod_global.nccl_table.erase(it);
+      Send_Sharp(state, it->first, &it->second.table_entry);
+      it = state.nccl_table.erase(it);
+      ++res;
     } else {
       ++it;
     }
-  } 
+  }
+  return res;
 }
 
+void Send_Sharp(HorovodGlobalState& state, uint16_t idx, TensorTableEntry* entry){
+  int res = 0;
+  state.sharp_table.emplace(idx, entry);
+  auto comm& = state.sharp_coll_comm;
 
-int Do_Sharp(HorovodGlobalState& state) {
+
+  struct sharp_coll_reduce_spec spec;
+
+  int sharp_coll_do_allreduce_nb(comm, spec, handle);
+  return res;
+}
+
+int Progress_Sharp(HorovodGlobalState& state){
+  
+
+}
+
+int Do_Sharp(HorovodGlobalState& state, MPI_Comm& local_comm) {
   // Initialize MPI. This must happen on the background thread, since not all
   // MPI implementations support being called from multiple threads.
 
@@ -1511,18 +1531,18 @@ int Do_Sharp(HorovodGlobalState& state) {
   MPI_Comm_size(MPI_COMM_WORLD, &size);
 
   // Determine local rank by querying the local communicator.
-  MPI_Comm local_comm;
-  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,
-                      &local_comm);
+
 
   int local_rank= state.local_rank;
+  int local_size= state.local_size;
+
+
 
   // Initialize the tensor count table. No tensors are available yet.
   
   state.message_table = std::unique_ptr<MessageTable>(new MessageTable());
 
-
-  AllReduceVector& vec = global.vec;
+  AllReduceVector& vec =  horovod_global.vec;
 
   int32_t bsize = vec.size();
   bool dev_init = false;
@@ -1538,7 +1558,7 @@ int Do_Sharp(HorovodGlobalState& state) {
     //memcpy(bufcopy,vec.buf(),bsize);
     MPI_Allreduce((void*) vec.buf, (void*) reduceBuf,
                               bsize, MPI_CHAR, MPI_BAND,
-                              local_comm;
+                              local_comm);
 
     vec.check(reduceBuf);
 
@@ -1562,6 +1582,10 @@ int Do_Sharp(HorovodGlobalState& state) {
         free(message);
       }
     }
+     
+    Progress_Nccl();
+
+    Progress_Sharp();
 
 
 
@@ -1596,10 +1620,16 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   int local_rank;
   MPI_Comm_rank(local_comm, &local_rank);
 
+
+  int local_size;
+  MPI_Comm_size(local_comm, &local_size);
+
+
   state.rank = rank;
   state.local_rank = local_rank;
   state.size = size;
   state.initialization_done = true;
+  state.local_size = local_size;
 
   // Open the timeline file on coordinator.
   auto horovod_timeline = std::getenv("HOROVOD_TIMELINE");
@@ -1614,9 +1644,9 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   }
 
   // Initialize the tensor count table. No tensors are available yet.
-  if (is_coordinator) {
-    state.message_table = std::unique_ptr<MessageTable>(new MessageTable());
-  }
+  
+  state.message_table = std::unique_ptr<MessageTable>(new MessageTable());
+  
 
   // The coordinator sends a SHUTDOWN message to trigger shutdown.
   bool should_shut_down = false;
@@ -1874,8 +1904,6 @@ static char *get_host_name(void)
 int InitSharp(){
   int ret = 0, rc;
   struct sharp_coll_init_spec init_spec = {0};
-  struct sharp_coll_context *sharp_coll_context;
-  struct sharp_coll_comm *sharp_coll_comm;
   struct sharp_coll_comm_init_spec comm_spec;
   struct timeval tval;
   init_spec.progress_func  = NULL;
@@ -1891,7 +1919,7 @@ int InitSharp(){
   init_spec.config.ib_dev_list = "mlx5_1";  
   /* initialize sharp coll */
   
-  ret = sharp_coll_init(&init_spec, &sharp_coll_context);
+  ret = sharp_coll_init(&init_spec, &(horovod_global.sharp_coll_context));
   if (ret < 0) {
     fprintf(stderr, "sharp_coll_init failed: %s\n", sharp_coll_strerror(ret));
     return ret;
@@ -1901,15 +1929,15 @@ int InitSharp(){
   comm_spec.size = 1;
   comm_spec.is_comm_world = 1;
   comm_spec.oob_ctx = NULL;
-  ret = sharp_coll_comm_init(sharp_coll_context, &comm_spec, &sharp_coll_comm);
+  ret = sharp_coll_comm_init((horovod_global.sharp_coll_context), &comm_spec, &(horovod_global.sharp_coll_comm));
   if (ret < 0) {
     fprintf(stderr, "sharp communicator creation failed: %s\n", sharp_coll_strerror(ret));
-    sharp_coll_finalize(sharp_coll_context);
+    sharp_coll_finalize(horovod_global.sharp_coll_context);
     return ret;
   }
   /* destroy group */
-  sharp_coll_comm_destroy(sharp_coll_comm);
-  sharp_coll_finalize(sharp_coll_context);
+  sharp_coll_comm_destroy((horovod_global.sharp_coll_comm));
+  sharp_coll_finalize(horovod_global.sharp_coll_context);
   return ret;
 }
 
@@ -2071,17 +2099,17 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, const Tensor& tensor,
     message->add_tensor_shape(tensor.shape().dim_size(i));
   }
 
-  TensorTableEntry e;
-  e.tensor_name = name;
-  e.context = context;
-  e.tensor = tensor;
-  e.output = output;
-  e.ready_event = ready_event;
-  e.device = device;
-  e.callback = callback;
+  TensorTableEntry* e = malloc(sizeof(TensorTableEntry));;
+  e->tensor_name = name;
+  e->context = context;
+  e->tensor = tensor;
+  e->output = output;
+  e->ready_event = ready_event;
+  e->device = device;
+  e->callback = callback;
 
   std::lock_guard<std::mutex> guard(horovod_global.sharp_mutex);
-  horovod_global.local_sync_table.emplace(idx, std::move(e));
+  horovod_global.local_sync_table.emplace(idx, e);
   horovod_global.vec.insert(idx,message);
 }
 #endif

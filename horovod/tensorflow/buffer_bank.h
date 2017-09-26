@@ -21,10 +21,11 @@ struct SharpBuf{
   ~SharpBuf();
 
   struct sharp_coll_context *ctx;
+
   void* buf;
+  size_t length;
   void* mr;
 }
-
 
 class BufferBank{
  public:
