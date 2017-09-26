@@ -774,6 +774,8 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
       }
 #endif
 
+      
+
       ACTIVITY_END_ALL(entries, timeline)
     }
   }

@@ -1,11 +1,42 @@
 #include "buffer_bank.h"
 
+#define PUT_ON_GPU
+
 namespace horovod {
 namespace tensorflow {
 
-SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sharp_coll_context ctx_): ctx(ctx_){
+SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sharp_coll_context ctx_, OpKernelContext* op_ctx): ctx(ctx_){
   specs.sbuf_desc.type = SHARP_DATA_BUFFER;
+
+#ifndef PUT_ON_GPU
   void* buf = (void*) malloc(buffer_size_ * sizeof(char));  //TODO: Put on GPU
+#else
+  ACTIVITY_START_ALL(entries, timeline, "INIT_FUSION_BUFFER")
+
+  // Lazily allocate persistent buffer for Tensor Fusion and keep it
+  // forever per device.
+  TensorShape buffer_shape;
+  buffer_shape.AddDim(buffer_size_);
+  buffer = new PersistentTensor();
+  Tensor* tensor;
+  Status status = op_ctx->allocate_persistent(
+      DT_INT8, buffer_shape, buffer, &tensor);
+  if (!status.ok()) {
+    printf("Persistent Tensor Allocation Failed!\n");
+    return;
+  }
+
+#if HAVE_CUDA
+  // On GPU allocation is asynchronous, we need to wait for it to
+  // complete.
+  auto device_context = op_ctx->op_device_context();
+  if (device_context != nullptr) {
+    device_context->stream()->BlockHostUntilDone();
+  }
+  buf = buffer->AccessTensor(first_entry.context)->tensor_data().data();
+#endif
+#endif
+
   specs.sbuf_desc.buffer.ptr = buf;
   int res = sharp_coll_reg_mr(ctx_, buf, buffer_size_, &specs.sbuf_desc.buffer.mem_handle);
   specs.sbuf_desc.buffer.length = buffer_size_;
@@ -26,6 +57,7 @@ SharpSpec::~SharpSpec(){
   if (res < 0){
     throw res;
   }
+  free(buffer);
   free(specs.sbuf_desc.buffer.ptr);
 }
 
@@ -38,6 +70,10 @@ struct sharp_coll_reduce_spec* SharpSpec::spec(int len) const{
   return &specs;
 }
 
+void SharpSpec::set_length(int len) const{
+  specs.length = len;
+}
+
 void* SharpSpec::sbuf() const{
   return specs.sbuf_desc.buffer.ptr;
 }
@@ -46,14 +82,11 @@ void* SharpSpec::rbuf() const{
   return specs.rbuf_desc.buffer.ptr;
 }
 
-void SharpSpec::set_length(int len) const{
-  specs.length = len;
-}
 
 
-BufferBank::BufferBank(size_t buffer_size_,  struct sharp_coll_context ctx_, enum sharp_datatype dtype_ = SHARP_DTYPE_FLOAT): 
-                       buffer_size(buffer_size_), count(0), ctx(ctx_), buffers(), freelist(), map(), dtype(dtype_){
-
+BufferBank::BufferBank(size_t buffer_size_,  struct sharp_coll_context ctx_, OpKernelContext* op_ctx_ , enum sharp_datatype dtype_ = SHARP_DTYPE_FLOAT): 
+                       buffer_size(buffer_size_), count(0), ctx(ctx_), buffers(), freelist(), map(), dtype(dtype_), op_ctx(op_ctx_){
+  
 
 }
 
@@ -68,7 +101,7 @@ SharpSpec* BufferBank::request(uint16_t idx){
 }
 
 SharpSpec* BufferBank::expand(){
-  SharpSpec* new_spec = new SharpSpec(buffer_size , ctx);
+  SharpSpec* new_spec = new SharpSpec(buffer_size , ctx, op_ctx);
   buffers.insert(buffers.end(), new_spec);
   freelist.push(count);
   ++count;
