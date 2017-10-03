@@ -11,8 +11,6 @@ SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sha
 #ifndef PUT_ON_GPU
   void* buf = (void*) malloc(buffer_size_ * sizeof(char));  //TODO: Put on GPU
 #else
-  ACTIVITY_START_ALL(entries, timeline, "INIT_FUSION_BUFFER")
-
   // Lazily allocate persistent buffer for Tensor Fusion and keep it
   // forever per device.
   TensorShape buffer_shape;
@@ -45,7 +43,9 @@ SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sha
      buf = NULL;
      return;
   }
-  specs.rbuf_desc = specs.sbuf_desc; //in place
+  //specs.rbuf_desc = specs.sbuf_desc; //in place
+  
+  specs.rbuf_desc.buffer.ptr = (void*) malloc(buffer_size_ * sizeof(char));
   specs.root = 0; //ignored
   specs.dtype = dtype_;
   specs.length = -1;
@@ -58,7 +58,10 @@ SharpSpec::~SharpSpec(){
     throw res;
   }
   free(buffer);
+  free(specs.rbuf_desc.buffer.ptr);
+#ifndef PUT_ON_GPU
   free(specs.sbuf_desc.buffer.ptr);
+#endif
 }
 
 struct sharp_coll_reduce_spec* SharpSpec::spec() const{
@@ -84,10 +87,14 @@ void* SharpSpec::rbuf() const{
 
 
 
-BufferBank::BufferBank(size_t buffer_size_,  struct sharp_coll_context ctx_, OpKernelContext* op_ctx_ , enum sharp_datatype dtype_ = SHARP_DTYPE_FLOAT): 
-                       buffer_size(buffer_size_), count(0), ctx(ctx_), buffers(), freelist(), map(), dtype(dtype_), op_ctx(op_ctx_){
-  
+BufferBank::BufferBank(): buffer_size(0), count(0), buffers(), freelist(), map(), initiated(false){}
 
+BufferBank::Init(size_t buffer_size_,  struct sharp_coll_context* ctx_, OpKernelContext* op_ctx_ , enum sharp_datatype dtype_ = SHARP_DTYPE_FLOAT){
+  buffer_size = buffer_size_;
+  ctx = ctx_;
+  op_ctx = op_ctx_;
+  dtype = dtype_;
+  initiated = true;
 }
 
 SharpSpec* BufferBank::request(uint16_t idx){
@@ -120,5 +127,7 @@ BufferBank::~BufferBank(){
   }
 }
 
-
+bool BufferBank::isInitiated() const{
+  return initiated;
+}
 }}

@@ -14,6 +14,15 @@
 // limitations under the License.
 // =============================================================================
 
+
+#ifndef HAVE_SHARP
+wuba wuba
+#endif
+
+#ifndef HAVE_CUDA
+dub dub
+#endif
+
 #include <queue>
 #include <thread>
 #include <unordered_map>
@@ -42,7 +51,6 @@
 #include "hash_vector.h"
 #include "mpi.h"
 #include "mpi_message.h"
-#include "AllReduceVector.h"
 #include "timeline.h"
 #include <bitset>
 
@@ -123,16 +131,34 @@ typedef struct {
   StatusCallback callback;
 } TensorTableEntry;
 
-typedef struct {
-  TensorTableEntry* table_entry;
-  cudaEvent_t event; 
-} EventTableEntry;
-
-
 typedef std::unordered_map<std::string, TensorTableEntry> TensorTable;
-typedef std::map<uint16_t , TensorTableEntry*> TensorIdxTable;
-typedef std::map<uint16_t , EventTableEntry> EventTable;
 
+#ifdef HAVE_SHARP
+typedef struct {
+  // Operation context.
+  OpKernelContext* context;
+  // Input tensor.
+  Tensor tensor;
+  // Pre-allocated output tensor.
+  Tensor* output;
+  // Event indicating that data is ready.
+  GPU_EVENT_IF_CUDA event;
+  // handle for sharp operations
+  void* sharp_handle;
+  // GPU to do reduction on, or CPU_DEVICE_ID in case of CPU.
+  int device;
+  // A callback to call with the status.
+  StatusCallback callback;
+
+  SharpSpec* spec;
+
+  uint16_t idx;
+
+} OpTableEntry;
+
+typedef std::map<uint16_t , OpTableEntry*> TensorIdxTable;
+
+#endif
 
 
 // Table for storing Tensor metadata on rank zero. This is used for error
@@ -220,17 +246,19 @@ struct HorovodGlobalState {
   size_t sharp_thresh;
   std::mutex sharp_mutex;
   ncclComm_t nccl_local_comm;
-  AllReduceVector vec;
   std::mutex local_mutex;
   std::queue<MPIRequest*> locally_reduced_queue;
   BufferBank bank;
+  std::mutex bank_mutex;
   int root_reducer;
-  TensorIdxTable local_sync_table;
+  std::list<OpTableEntry*> setup_list;
   EventTable nccl_table;
-  TensorIdxTable sharp_table;
+  std::list<OpTableEntry*> sharp_list;
+  std::list<OpTableEntry*> final_list;
+
   int local_size = 1;
-  struct sharp_coll_context *sharp_coll_context;
-  struct sharp_coll_comm *sharp_coll_comm;
+  struct sharp_coll_context* sharp_context;
+  struct sharp_coll_comm* sharp_comm;
 #endif
 
 // We reuse CUDA events as it appears that their creation carries non-zero cost.
@@ -591,6 +619,18 @@ Status GetNCCLDataType(const Tensor tensor, ncclDataType_t* dtype) {
   }
 
 
+#ifdef HAVE_SHARP
+#define SHARP_CHECK(entry, op_name, op)                                        \
+  {                                                                            \
+    auto sharp_result = (op);                                                  \
+    if (sharp_result != SHARP_COLL_SUCCESS) {                                  \
+      entry->callback(                                                         \
+          errors::Unknown(op_name, " failed, see MPI output for details."));   \
+      return;                                                                  \
+    }                                                                          \
+  }
+#endif
+
 #define CUDA_CHECK(entries, op_name, op)                                       \
   {                                                                            \
     auto cuda_result = (op);                                                   \
@@ -608,12 +648,14 @@ Status GetNCCLDataType(const Tensor tensor, ncclDataType_t* dtype) {
   {                                                                            \
     auto cuda_result = (op);                                                   \
     if (cuda_result != cudaSuccess) {                                          \
-      timeline.End(entry->tensor_name, nullptr);                                \
-      entry->callback(errors::Unknown(                                          \
+      timeline.End(entry->tensor_name, nullptr);                               \
+      entry->callback(errors::Unknown(                                         \
           op_name, " failed: ", cudaGetErrorString(cuda_result)));             \
       return;                                                                  \
     }                                                                          \
   }
+
+
 
 
 
@@ -1322,6 +1364,7 @@ void CheckForStalledTensors(HorovodGlobalState& state) {
 //      loop.
 
 #ifdef HAVE_SHARP
+
 int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& local_comm, BufferBank& bank, int rank, uint16_t idx){
   //Perform_Operation
   TensorTableEntry* entry;
@@ -1486,115 +1529,85 @@ int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& 
 //PerformOperation
 }
 
-int Progress_Nccl(HorovodGlobalState& state){
-  int res = 0;
-  for (EventTable::iterator it = state.nccl_table.begin(); it != state.nccl_table.end();){
-    cudaEvent_t& done_event = it->second.event;
-    if (cudaEventQuery(done_event) == cudaSuccess){
-      Send_Sharp(state, it->first, &it->second.table_entry);
-      it = state.nccl_table.erase(it);
-      ++res;
+int Send_Sharp(HorovodGlobalState& state){
+  std::list<OpTableEntry*>& list = state.setup_list;
+  int res;
+ 
+  //Check for device-to-device copy event completion on GPU, and put the completed in the tempQ.
+  std::queue<OpTableEntry*> tempQ;
+  {
+    std::lock_guard<std::mutex> guard(state.sharp_mutex);
+    for (std::list<OpTableEntry*>::iterator it = list.begin(); it != list.end(); ++it){
+      OpTableEntry* entry = (*it);
+      if (!entry->event || entry->event->PollForStatus() != perftools::gputools::Event::Status::kPending){
+        tempQ.insert(entry);
+        it = list.erase(it);
+      } else {
+        ++it;
+      }
+    `}
+  }
+
+  //Go over the tempQ and send sharp.
+  while(!tempQ.empty()){
+     OpTableEntry* entry = tempQ.front;
+     tempQ.pop();
+     size_t len = entry->tensor.tensor_data().size(); 
+     SHARP_CHECK(entry, "sharp allreduce nb", sharp_coll_do_allreduce_nb(state.sharp_comm, entry->spec->spec(len), &(entry->sharp_handle))  )
+     state.sharp_list.push_front(entry);
+  }
+
+  //Sharp progress
+  res = sharp_coll_progress(sharp_context);
+  if (res != SHARP_COLL_SUCCESS){
+    printf("sharp progress failure\n");
+    return 0;
+  }
+
+  std::list<OpTableEntry*>& sharp_list = state.sharp_list;
+
+
+  // check for Sharp completion, and async pass data from sharp rbuf back to the GPU buffer.
+  for (std::list<OpTableEntry*>::iterator it = sharp_list.begin(); it != sharp_list.end(); ++it){
+    OpTableEntry* entry = (*it);
+    res = sharp_coll_req_test(entry->sharp_handle);
+    if (res){
+      SHARP_CHECK(entry, "Sharp Request Free" , sharp_coll_req_free(entry->sharp_handle))
+      auto device_context = entry->context->op_device_context();
+      assert(device_context != nullptr)      
+      auto stream = device_context->stream()->parent();
+      cudaMemcpyAsync((void*) entry->output->tensor_data().data(),
+                      (const void*) entry->spec->rbuf(),
+	              entry->tensor.tensor_data().size(),
+		      cudaMemcpyHostToDevice,
+                      stream);
+      GPU_EVENT_IF_CUDA ready_event = RecordReadyEvent(entry->context);
+      event->event = ready_event;
+      state.final_list.push_front(entry);
+      it = sharp_list.erase(it);
     } else {
       ++it;
     }
   }
-  return res;
-}
 
-void Send_Sharp(HorovodGlobalState& state, uint16_t idx, TensorTableEntry* entry){
-  int res = 0;
-  state.sharp_table.emplace(idx, entry);
-  auto comm& = state.sharp_coll_comm;
+  std::list<OpTableEntry*>& flist = state.sharp_list;
 
 
-  struct sharp_coll_reduce_spec spec;
-
-  int sharp_coll_do_allreduce_nb(comm, spec, handle);
-  return res;
-}
-
-int Progress_Sharp(HorovodGlobalState& state){
-  
-
-}
-
-int Do_Sharp(HorovodGlobalState& state, MPI_Comm& local_comm) {
-  // Initialize MPI. This must happen on the background thread, since not all
-  // MPI implementations support being called from multiple threads.
-
-  // Get MPI rank to determine if we are rank zero.
-  int rank = state.rank;
-  bool is_coordinator = rank == 0;
-  
-
-
-  // Get MPI size to determine how many tensors to wait for before reducing.
-  int size = state.size;
-  MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-  // Determine local rank by querying the local communicator.
-
-
-  int local_rank= state.local_rank;
-  int local_size= state.local_size;
-
-
-
-  // Initialize the tensor count table. No tensors are available yet.
-  
-  state.message_table = std::unique_ptr<MessageTable>(new MessageTable());
-
-  AllReduceVector& vec =  horovod_global.vec;
-
-  int32_t bsize = vec.size();
-  bool dev_init = false;
-  std::vector<int32_t> devices(size);
-  do {
-
-    //// Check Sharp Queue And sync locally
-    {
-      std::lock_guard<std::mutex> guard(state.sharp_mutex);
-      vec.addAll();
+  //check for data copy events completion, free resources, and call callback
+  for (std::list<OpTableEntry*>::iterator it = flist.begin(); it != flist.end(); ++it){
+    OpTableEntry* entry = (*it);
+    if (!entry->event || entry->event->PollForStatus() != perftools::gputools::Event::Status::kPending){
+      entry->callback(Status::OK());
+      free(entry);
+      it = list.erase(it);
+    } else {
+      ++it;
     }
+  }
 
-    //memcpy(bufcopy,vec.buf(),bsize);
-    MPI_Allreduce((void*) vec.buf, (void*) reduceBuf,
-                              bsize, MPI_CHAR, MPI_BAND,
-                              local_comm);
-
-    vec.check(reduceBuf);
-
-    //// Locally allreduce the tensors
-    {
-      while (vec.num_ready()>0){
-        MPIRequest* req =  vec.pop();
-        IncrementTensorCount(state.message_table, (*message), size);
-        MPIResponse response;
-        auto name = message->tensor_name();
-        response.add_tensor_names(name);
-        auto message_type = message->request_type();
-	if (message_type == MPIRequest::ALLGATHER) {
-	  response.set_response_type(MPIResponse::ALLGATHER);
-	} else if (message_type == MPIRequest::ALLREDUCE) {
-	  response.set_response_type(MPIResponse::ALLREDUCE);
-	} else if (message_type == MPIRequest::BROADCAST) {
-	  response.set_response_type(MPIResponse::BROADCAST);
-	}
-        Local_Allreduce(state.message_table, response, local_comm, state.bank, local_rank, message->idx());
-        free(message);
-      }
-    }
-     
-    Progress_Nccl();
-
-    Progress_Sharp();
-
-
-
-    //if (state.shut_down) vec.markLast();
-  } while (!vec.isLast());
 
 }
+
 
 #endif
 
@@ -1644,6 +1657,8 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   if (horovod_fusion_threshold != nullptr) {
     state.tensor_fusion_threshold = size_t(std::atol(horovod_fusion_threshold));
   }
+
+
 
   // Initialize the tensor count table. No tensors are available yet.
   
@@ -1921,7 +1936,7 @@ int InitSharp(){
   init_spec.config.ib_dev_list = "mlx5_1";  
   /* initialize sharp coll */
   
-  ret = sharp_coll_init(&init_spec, &(horovod_global.sharp_coll_context));
+  ret = sharp_coll_init(&init_spec, &(horovod_global.sharp_context));
   if (ret < 0) {
     fprintf(stderr, "sharp_coll_init failed: %s\n", sharp_coll_strerror(ret));
     return ret;
@@ -1931,15 +1946,15 @@ int InitSharp(){
   comm_spec.size = 1;
   comm_spec.is_comm_world = 1;
   comm_spec.oob_ctx = NULL;
-  ret = sharp_coll_comm_init((horovod_global.sharp_coll_context), &comm_spec, &(horovod_global.sharp_coll_comm));
+  ret = sharp_coll_comm_init((horovod_global.sharp_context), &comm_spec, &(horovod_global.sharp_coll_comm));
   if (ret < 0) {
     fprintf(stderr, "sharp communicator creation failed: %s\n", sharp_coll_strerror(ret));
-    sharp_coll_finalize(horovod_global.sharp_coll_context);
+    sharp_coll_finalize(horovod_global.sharp_context);
     return ret;
   }
   /* destroy group */
   sharp_coll_comm_destroy((horovod_global.sharp_coll_comm));
-  sharp_coll_finalize(horovod_global.sharp_coll_context);
+  sharp_coll_finalize(horovod_global.sharp_context);
   return ret;
 }
 
@@ -1952,9 +1967,19 @@ void InitializeHorovodOnce() {
   if (!horovod_global.initialize_flag.test_and_set()) {
 #if HAVE_SHARP
     int ret;
-    ret = InitSharp();
-    horovod_global.sharp_thresh = ((ret>=0)?256:0);
-#endif
+    intret = InitSharp();
+    if (ret>=0){
+      auto sharp_threshold = std::getenv("HOROVOD_SHARP_THRESHOLD");
+      if (sharp_threshold != nullptr) {
+	horovod_global.sharp_thresh = size_t(std::atol(sharp_threshold));
+      } else {
+        horovod_global.sharp_thresh = 256;
+      }
+    } else {
+      horovod_global.sharp_thresh = 0;
+    }
+
+    #endif
     horovod_global.background_thread =
         std::thread(BackgroundThreadLoop, std::ref(horovod_global));
   }
@@ -2078,59 +2103,80 @@ void EnqueueTensorAllreduce(OpKernelContext* context, const Tensor& tensor,
 #ifdef HAVE_SHARP
 
 void EnqueueTensorSharpAllreduce(OpKernelContext* context, const Tensor& tensor,
-                            Tensor* output, const int32_t& idx  , GPU_EVENT_IF_CUDA ready_event,
-                            const std::string name, const int device,
+                            Tensor* output, const int32_t& idx,
+                            const int device,
                             StatusCallback callback) {
-  MPIDataType dtype;
-  Status status = DataTypeToMPIType(tensor.dtype(), &dtype);
-  if (!status.ok()) {
-    callback(status);
-    return;
-  }
-  int rank;  
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-  MPIRequest* message = new MPIRequest();
-  message->set_request_rank(rank);
-  message->set_tensor_name(name);
-  message->set_tensor_type(dtype);
-  message->set_device(device);
-  message->set_request_type(MPIRequest::ALLREDUCE);
-  message->set_idx((uint16_t) idx);
-  for (int i = 0; i < tensor.shape().dims(); i++) {
-    message->add_tensor_shape(tensor.shape().dim_size(i));
+
+
+// first, I am passing the data to the buffers registered to sharp_reg_mr
+// We plan for the case they are on the GPU.
+// TODO: Check if we can change the allocation attributes to have the tensor ready on registered space.
+  SharpSpec* sharp_spec;
+  BufferBank& bank = horovod_global.bank;
+  {
+    std::lock_guard<std::mutex> guard(horovod_global.bank_mutex);
+    if (!bank.isInitiated()){
+      bank.Init(horovod_global.sharp_thresh, horovod_global.sharp_coll_contex, context, SHARP_DTYPE_FLOAT);
+    } 
+    sharp_spec = bank.request(idx);
+  }
+ 
+#if HAVE_CUDA
+  if (device != CPU_DEVICE_ID) 
+  {
+    auto device_context = context->op_device_context();
+    if (device_context != nullptr) 
+    {
+      auto stream = device_context->stream()->parent();
+      cudaMemcpyAsync((void*) sharp_spec.sbuf() ,
+                      (const void*)  tensor.tensor_data().data(),
+		      tensor.tensor_data().size(),
+		      cudaMemcpyDeviceToDevice,
+		      stream);
+    }
+  } 
+  else 
+#endif
+  {
+    memcpy((void*) sharp_spec.sbuf(),
+	   (const void*) tensor.tensor_data().data(),
+	   tensor.tensor_data().size());
   }
 
-  TensorTableEntry* e = malloc(sizeof(TensorTableEntry));;
-  e->tensor_name = name;
+  GPU_EVENT_IF_CUDA ready_event = RecordReadyEvent(context);
+
+  OpTableEntry* e = malloc(sizeof(OpTableEntry));;
   e->context = context;
   e->tensor = tensor;
   e->output = output;
-  e->ready_event = ready_event;
+  e->event = ready_event;
   e->device = device;
-  e->callback = callback;
+  e->callback = callbck;
+  e->spec = sharp_spec;
+  e->idx = idx;
 
   std::lock_guard<std::mutex> guard(horovod_global.sharp_mutex);
-  horovod_global.local_sync_table.emplace(idx, e);
-  horovod_global.vec.insert(idx,message);
+  horovod_global.setup_list.push_front(e);
 }
 #endif
 
 // MPI must be initialized and the background thread must be running before
 // this function is called.
 void EnqueueTensorAllreduce2(OpKernelContext* context, const Tensor& tensor, 
-                            Tensor* output, const int32_t& idx  , GPU_EVENT_IF_CUDA ready_event,
+                            Tensor* output, const int32_t& idx,
                             const std::string name, const int device,
                             StatusCallback callback) {
 
 #ifdef HAVE_SHARP
-  if (horovod_global.sharp_thresh > tensor.tensor_data().size() 
+  if (device != CPU_DEVICE_ID && horovod_global.sharp_thresh > tensor.tensor_data().size()) 
   {
-    EnqueueTensorSharpAllreduce(context,tensor,output, idx ,ready_event,name,device,callback);
+    EnqueueTensorSharpAllreduce(context,tensor,output, idx ,device,callback);
   } 
   else 
 #endif
   {
+    GPU_EVENT_IF_CUDA ready_event = RecordReadyEvent(context);
     EnqueueTensorAllreduce(context,tensor,output,ready_event,name,device,callback);
   }
   return;
@@ -2316,8 +2362,8 @@ public:
     Tensor* output;
     OP_REQUIRES_OK(context,
                    context->allocate_output(0, tensor.shape(), &output));
-    GPU_EVENT_IF_CUDA ready_event = RecordReadyEvent(context);
-    EnqueueTensorAllreduce2(context, tensor, output, idx , ready_event, node_name,
+//    GPU_EVENT_IF_CUDA ready_event = RecordReadyEvent(context);
+    EnqueueTensorAllreduce2(context, tensor, output, idx , node_name,
                            device, [context, done](const Status& status) {
                              context->SetStatus(status);
                              done();
