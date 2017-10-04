@@ -21,9 +21,13 @@ import subprocess
 import textwrap
 import traceback
 
-os.environ["HOROVOD_SHARP_HOME"] = "/yanivbl/sharp/install"
-os.environ["HOROVOD_SHARP_INCLUDE"] = ""
-os.environ["HOROVOD_SHARP_LIB"] = ""
+
+
+##os.environ["HOROVOD_SHARP_HOME"] = "/yanivbl/sharp/install"
+##os.environ["HOROVOD_SHARP_INCLUDE"] = ""
+##os.environ["HOROVOD_SHARP_LIB"] = ""
+
+##export PATH=$PATH:"/machineLearning/users/borisko/openmpi-2.1.1/vanilla/bin/"
 
 tensorflow_mpi_lib = Extension('horovod.tensorflow.mpi_lib', [])
 
@@ -292,7 +296,7 @@ def fully_define_extension(build_ext):
 
     if gpu_allreduce and gpu_allreduce != 'NCCL' and node_allreduce == 'SHARP':
         raise DistutilsError('SHARP is not supported, and if it was supported it would have required NCCL')
-                             
+
 
     if gpu_allreduce or gpu_allgather or gpu_broadcast:
         have_cuda = True
@@ -309,6 +313,7 @@ def fully_define_extension(build_ext):
         have_nccl = False
         nccl_include_dirs = nccl_lib_dirs = []
 
+
     if node_allreduce == 'SHARP':
         print("-------------------------------------\nAdding SHARP\n------------------------------------")
         have_sharp = True
@@ -322,8 +327,7 @@ def fully_define_extension(build_ext):
     SOURCES = ['horovod/tensorflow/mpi_message.cc',
                'horovod/tensorflow/mpi_ops.cc',
                'horovod/tensorflow/timeline.cc',
-               'horovod/tensorflow/AllReduceVector.cc]',
-               'horovod/tensorflow/buffer_bank.cc]'
+               'horovod/tensorflow/buffer_bank.cc']
     COMPILE_FLAGS = ['-std=c++11', '-fPIC', '-O2'] + shlex.split(mpi_flags)
     LINK_FLAGS = shlex.split(mpi_flags)
     LIBRARY_DIRS = tf_lib_dirs

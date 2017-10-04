@@ -26,10 +26,12 @@ dub dub
 #include <queue>
 #include <thread>
 #include <unordered_map>
+#include <list>
 
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/shape_inference.h"
+#include "tensorflow/core/common_runtime/dma_helper.h"
 
 #define EIGEN_USE_THREADS
 
@@ -88,11 +90,20 @@ dub dub
  */
 
 using namespace tensorflow;
+using perftools::gputools::DeviceMemoryBase;
 
 namespace horovod {
 namespace tensorflow {
 
 namespace {
+
+
+
+void* GetBase(Tensor* dst) { 
+  return DMAHelper::base(dst);
+}
+
+
 
 // Device ID used for CPU.
 #define CPU_DEVICE_ID -1
@@ -104,6 +115,22 @@ namespace {
 #else
 #define GPU_EVENT_IF_CUDA void*
 #endif
+
+// On GPU this event will signal that data is ready, and tensors are
+// allocated.
+GPU_EVENT_IF_CUDA RecordReadyEvent(OpKernelContext* context) {
+#if HAVE_CUDA
+  auto device_context = context->op_device_context();
+  if (device_context != nullptr) {
+    auto executor = device_context->stream()->parent();
+    GPU_EVENT_IF_CUDA ready_event = new perftools::gputools::Event(executor);
+    ready_event->Init();
+    device_context->stream()->ThenRecordEvent(ready_event);
+    return ready_event;
+  }
+#endif
+  return nullptr;
+}
 
 // A callback to call after the MPI communication completes. Since the
 // allreduce and allgather ops are asynchronous, this callback is what resumes
@@ -252,7 +279,6 @@ struct HorovodGlobalState {
   std::mutex bank_mutex;
   int root_reducer;
   std::list<OpTableEntry*> setup_list;
-  EventTable nccl_table;
   std::list<OpTableEntry*> sharp_list;
   std::list<OpTableEntry*> final_list;
 
@@ -611,8 +637,8 @@ Status GetNCCLDataType(const Tensor tensor, ncclDataType_t* dtype) {
   {                                                                            \
     auto mpi_result = (op);                                                    \
     if (mpi_result != MPI_SUCCESS) {                                           \
-      timeline.End(entry->tensor_name, nullptr);                                \
-      entry->callback(                                                          \
+      timeline.End(entry->tensor_name, nullptr);                               \
+      entry->callback(                                                         \
           errors::Unknown(op_name, " failed, see MPI output for details."));   \
       return;                                                                  \
     }                                                                          \
@@ -951,7 +977,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
       auto stream = horovod_global.streams[first_entry.device];
 
       // Ensure NCCL communicator is in the map before executing reduction.
-      ncclComm_t& nccl_comm = horovod_global.nccl_comms
+      ncclComm_t& nccl_comm = horovod_global.nccl_comms[response.devices()];
       if (nccl_comm == nullptr) {
         ACTIVITY_START_ALL(entries, timeline, "INIT_NCCL")
 
@@ -1365,171 +1391,7 @@ void CheckForStalledTensors(HorovodGlobalState& state) {
 
 #ifdef HAVE_SHARP
 
-int Local_Allreduce(TensorTable& tensor_table, MPIResponse& response, MPI_Comm& local_comm, BufferBank& bank, int rank, uint16_t idx){
-  //Perform_Operation
-  TensorTableEntry* entry;
-  {
-    // Lock on the tensor table.
-    std::lock_guard<std::mutex> guard(horovod_global.sharp_mutex);
-
-    auto idx = response.idx();
-
-    auto iter = local_sync_table.find(idx);
-    assert(iter! = local_sync_table.end());
-
-    assert(response.response_type() == MPIResponse::ALLREDUCE ||
-           response.response_type() == MPIResponse::ALLGATHER ||
-           response.response_type() == MPIResponse::BROADCAST ||
-           response.response_type() == MPIResponse::ERROR);
-
-    entry = iter->second;
-    local_sync_table.erase(iter);
-  }
-
-
-#if HAVE_CUDA
-  bool on_gpu = entry->device != CPU_DEVICE_ID;
-  if (on_gpu) {
-    CUDA_CHECK1(entry, "cudaSetDevice", cudaSetDevice(entry->device))
-    // Ensure stream is in the map before executing reduction.
-    cudaStream_t& stream = horovod_global.streams[entry->device];
-    if (stream == nullptr) {
-      CUDA_CHECK1(entry, "cudaStreamCreate", cudaStreamCreate(&stream))
-    }
-  }
-#endif
-
-#if HOROVOD_GPU_ALLREDUCE == 'N' // 'N' stands for NCCL
-    if (on_gpu) {
-      auto stream = horovod_global.streams[entry->device];
-
-      // Ensure NCCL communicator is in the map before executing reduction.
-      ncclComm_t& nccl_comm = nccl_local_comm;
-      if (nccl_comm == nullptr) {
-        timeline.ActivityStart(entry->tensor_name, "INIT_LOCAL_NCCL");     
-
-
-        ncclUniqueId nccl_id;
-        if (horovod_global.local_rank == 0) {
-          NCCL_CHECK1(entry, "ncclGetUniqueId", ncclGetUniqueId(&nccl_id))
-        }
-
-        MPI_CHECK1(entry, "MPI_Bcast",
-                  MPI_Bcast((void*)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0,
-                           local_comm));
-
-        NCCL_CHECK1(entry, "ncclCommInitRank",
-                   ncclCommInitRank(&nccl_comm, horovod_global.local_size, nccl_id,
-                                    horovod_global.local_rank))
-
-        // TODO: Rohit (NVIDIA): figure out why we need this sleep
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-
-        ACTIVITY_END_ONE(entry, timeline)
-      }
-
-      ncclDataType_t dtype;
-      status = GetNCCLDataType(entry->tensor, &dtype);
-      if (!status.ok()) {
-        timeline.End(entry->tensor_name, nullptr);
-        entry->callback(status);
-        return;
-      }
-
-      ACTIVITY_START_ONE(entry, timeline, "SCHEDULE")
-
-      cudaEvent_t queue_end_event = nullptr;
-      if (timeline.Initialized()) {
-        CUDA_CHECK1(entry, "GetCudaEvent", GetCudaEvent(&queue_end_event))
-        CUDA_CHECK1(entry, "cudaEventRecord", cudaEventRecord(event, stream))
-      }
-
-      cudaEvent_t after_reduce_event = nullptr;
-
-
-      int root = GET_ROOT;
-
-
-      void* dest = (rank == root)? bank.request(idx) : NULL ;
-
-      NCCL_CHECK1(entry, "ncclAllReduce",
-                 ncclReduce((const void*) entry->tensor.tensor_data().data(),
-                               dest,
-                               (size_t) entry->tensor.NumElements(), dtype, ncclSum,
-                               root ,nccl_comm, stream))
-
-      if (timeline.Initialized()) {
-        CUDA_CHECK1(entry, "GetCudaEvent", GetCudaEvent(&after_reduce_event))
-        CUDA_CHECK1(entry, "cudaEventRecord", cudaEventRecord(event, stream))
-      }
-
-      ACTIVITY_END_ONE(entry, timeline)
-      ACTIVITY_START_ONE(entry, timeline, "QUEUE")
-
-      // Use completion marker via event because it's faster than
-      // blocking cudaStreamSynchronize() in this thread.
-      cudaEvent_t done_event;
-      RECORD_EVENT(entries, done_event, stream)
-
-      EventTableEntry event_entry;
-      event_entry.event = done_event; 
-      event_entry.table_entry = entry;
-
-      horovod_global.nccl_table.emplace(idx, std::move(event_entry));
-
-      // TODO: use thread pool or single thread for callbacks
-#if 0
-      std::thread finalizer_thread([entries, first_entry, done_event,
-                                    queue_end_event, 
-                                    after_reduce_event, 
-                                    response, &timeline] {
-        CUDA_CHECK(entries, "cudaSetDevice", cudaSetDevice(first_entry.device))
-        if (queue_end_event != nullptr) {
-          CUDA_CHECK(entries, "cudaEventSynchronize",
-                     cudaEventSynchronize(queue_end_event))
-          // All the work scheduled on NCCL stream before this allreduce
-          // is done at this point, end queueing activity.
-          ACTIVITY_END_ALL(entries, timeline)
-          RELEASE_EVENT(entries, queue_end_event);
-        }
-
-        if (after_reduce_event != nullptr) {
-          ACTIVITY_START_ALL(entries, timeline, "NCCL_ALLREDUCE")
-          CUDA_CHECK(entries, "cudaEventSynchronize",
-                     cudaEventSynchronize(after_reduce_event))
-          // The allreduce is done after this point has been reached.
-          ACTIVITY_END_ALL(entries, timeline)
-          RELEASE_EVENT(entries, after_reduce_event);
-        }
-
-        CUDA_CHECK(entries, "cudaEventSynchronize",
-                   cudaEventSynchronize(done_event))
-        for (auto it = entries.begin(); it != entries.end(); it++) {
-          timeline.End(it->tensor_name, it->output);
-          it->callback(Status::OK());  //TODO: Post_Sharp!
-        }
-        RELEASE_EVENT(entries, done_event);
-      });
-
-      finalizer_thread.detach();
-#endif
-      return;
-    }
-#endif
-
-    MPI_Datatype dtype;
-    status = GetMPIDataType(first_entry.tensor, &dtype);
-    if (!status.ok()) {
-      for (auto it = entries.begin(); it != entries.end(); it++) {
-        timeline.End(it->tensor_name, nullptr);
-        it->callback(status);
-      }
-      return;
-    }
-//PerformOperation
-}
-
-int Send_Sharp(HorovodGlobalState& state){
+void Send_Sharp(HorovodGlobalState& state){
   std::list<OpTableEntry*>& list = state.setup_list;
   int res;
  
@@ -1540,17 +1402,17 @@ int Send_Sharp(HorovodGlobalState& state){
     for (std::list<OpTableEntry*>::iterator it = list.begin(); it != list.end(); ++it){
       OpTableEntry* entry = (*it);
       if (!entry->event || entry->event->PollForStatus() != perftools::gputools::Event::Status::kPending){
-        tempQ.insert(entry);
+        tempQ.push(entry);
         it = list.erase(it);
       } else {
         ++it;
       }
-    `}
+    }
   }
 
   //Go over the tempQ and send sharp.
   while(!tempQ.empty()){
-     OpTableEntry* entry = tempQ.front;
+     OpTableEntry* entry = tempQ.front();
      tempQ.pop();
      size_t len = entry->tensor.tensor_data().size(); 
      SHARP_CHECK(entry, "sharp allreduce nb", sharp_coll_do_allreduce_nb(state.sharp_comm, entry->spec->spec(len), &(entry->sharp_handle))  )
@@ -1558,10 +1420,10 @@ int Send_Sharp(HorovodGlobalState& state){
   }
 
   //Sharp progress
-  res = sharp_coll_progress(sharp_context);
+  res = sharp_coll_progress(state.sharp_context);
   if (res != SHARP_COLL_SUCCESS){
     printf("sharp progress failure\n");
-    return 0;
+    return;
   }
 
   std::list<OpTableEntry*>& sharp_list = state.sharp_list;
@@ -1574,15 +1436,22 @@ int Send_Sharp(HorovodGlobalState& state){
     if (res){
       SHARP_CHECK(entry, "Sharp Request Free" , sharp_coll_req_free(entry->sharp_handle))
       auto device_context = entry->context->op_device_context();
-      assert(device_context != nullptr)      
-      auto stream = device_context->stream()->parent();
+      assert(device_context != nullptr); 
+      auto stream = device_context->stream();
+
+#if 0
       cudaMemcpyAsync((void*) entry->output->tensor_data().data(),
                       (const void*) entry->spec->rbuf(),
 	              entry->tensor.tensor_data().size(),
 		      cudaMemcpyHostToDevice,
                       stream);
+#endif
+      void* dst_buf = GetBase(entry->output);
+      DeviceMemoryBase gpu_dst_ptr(dst_buf, entry->tensor.tensor_data().size() );
+      stream->ThenMemcpy(&gpu_dst_ptr, entry->spec->rbuf(), (uint64_t) entry->tensor.tensor_data().size());
+
       GPU_EVENT_IF_CUDA ready_event = RecordReadyEvent(entry->context);
-      event->event = ready_event;
+      entry->event = ready_event;
       state.final_list.push_front(entry);
       it = sharp_list.erase(it);
     } else {
@@ -1918,11 +1787,37 @@ static char *get_host_name(void)
     return hostname;
 }
 
+
+int pciMatch(char* A, char* B) {  //Taken as is 
+  char* a = A;
+  char* b = B;
+  int match = 0;
+  while ((*a) && (*b) && (*a)==(*b)) {
+    ++match;
+  }
+  return match;
+}
+
+#define PCI_MAX_MATCH 100
+
+char* getClosestNicName(){
+  char* gpuBusId = new char[PCI_MAX_MATCH];
+  cudaError_t res =  cudaDeviceGetPCIBusId( gpuBusId, PCI_MAX_MATCH, 0 );
+  if (res != cudaSuccess){
+    printf("cudaDeviceGetPCIBusId failed\n");
+  }
+
+  return gpuBusId;
+
+}
+
+
+
 int InitSharp(){
-  int ret = 0, rc;
+  int ret = 0;
   struct sharp_coll_init_spec init_spec = {0};
   struct sharp_coll_comm_init_spec comm_spec;
-  struct timeval tval;
+  //struct timeval tval;
   init_spec.progress_func  = NULL;
   /* coverity[dont_call] */
   init_spec.job_id = (gethostid() << 32) | rand();
@@ -1933,7 +1828,15 @@ int InitSharp(){
   init_spec.oob_colls.bcast = oob_bcast;
   init_spec.oob_colls.gather = oob_gather;
   init_spec.config = sharp_coll_default_config;
-  init_spec.config.ib_dev_list = "mlx5_1";  
+
+  init_spec.config.ib_dev_list = getClosestNicName(); 
+
+  printf("device = %s\n",init_spec.config.ib_dev_list);
+
+  return -1;
+
+
+
   /* initialize sharp coll */
   
   ret = sharp_coll_init(&init_spec, &(horovod_global.sharp_context));
@@ -1946,14 +1849,14 @@ int InitSharp(){
   comm_spec.size = 1;
   comm_spec.is_comm_world = 1;
   comm_spec.oob_ctx = NULL;
-  ret = sharp_coll_comm_init((horovod_global.sharp_context), &comm_spec, &(horovod_global.sharp_coll_comm));
+  ret = sharp_coll_comm_init((horovod_global.sharp_context), &comm_spec, &(horovod_global.sharp_comm));
   if (ret < 0) {
     fprintf(stderr, "sharp communicator creation failed: %s\n", sharp_coll_strerror(ret));
     sharp_coll_finalize(horovod_global.sharp_context);
     return ret;
   }
   /* destroy group */
-  sharp_coll_comm_destroy((horovod_global.sharp_coll_comm));
+  sharp_coll_comm_destroy((horovod_global.sharp_comm));
   sharp_coll_finalize(horovod_global.sharp_context);
   return ret;
 }
@@ -1966,8 +1869,7 @@ void InitializeHorovodOnce() {
   // Ensure background thread is only started once.
   if (!horovod_global.initialize_flag.test_and_set()) {
 #if HAVE_SHARP
-    int ret;
-    intret = InitSharp();
+    int ret = InitSharp();
     if (ret>=0){
       auto sharp_threshold = std::getenv("HOROVOD_SHARP_THRESHOLD");
       if (sharp_threshold != nullptr) {
@@ -1977,6 +1879,7 @@ void InitializeHorovodOnce() {
       }
     } else {
       horovod_global.sharp_thresh = 0;
+      printf("Sharp thresh set to 0. Sharp is not being used\n");
     }
 
     #endif
@@ -2102,7 +2005,7 @@ void EnqueueTensorAllreduce(OpKernelContext* context, const Tensor& tensor,
 
 #ifdef HAVE_SHARP
 
-void EnqueueTensorSharpAllreduce(OpKernelContext* context, const Tensor& tensor,
+void EnqueueTensorSharpAllreduce(OpKernelContext* context, Tensor& tensor,
                             Tensor* output, const int32_t& idx,
                             const int device,
                             StatusCallback callback) {
@@ -2117,7 +2020,7 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, const Tensor& tensor,
   {
     std::lock_guard<std::mutex> guard(horovod_global.bank_mutex);
     if (!bank.isInitiated()){
-      bank.Init(horovod_global.sharp_thresh, horovod_global.sharp_coll_contex, context, SHARP_DTYPE_FLOAT);
+      bank.Init(horovod_global.sharp_thresh, horovod_global.sharp_context, context, SHARP_DTYPE_FLOAT);
     } 
     sharp_spec = bank.request(idx);
   }
@@ -2128,31 +2031,40 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, const Tensor& tensor,
     auto device_context = context->op_device_context();
     if (device_context != nullptr) 
     {
-      auto stream = device_context->stream()->parent();
+      auto stream = device_context->stream();
+#if 0
       cudaMemcpyAsync((void*) sharp_spec.sbuf() ,
                       (const void*)  tensor.tensor_data().data(),
 		      tensor.tensor_data().size(),
 		      cudaMemcpyDeviceToDevice,
 		      stream);
+#else
+      size_t tsize = tensor.tensor_data().size();
+      void* src_buf = GetBase(&tensor);
+
+      DeviceMemoryBase gpu_src_ptr(src_buf , tsize );
+      DeviceMemoryBase gpu_dst_ptr(sharp_spec->sbuf() , tsize );
+      stream->ThenMemcpy(&gpu_dst_ptr, gpu_src_ptr, tsize);
+#endif
     }
   } 
   else 
 #endif
   {
-    memcpy((void*) sharp_spec.sbuf(),
+    memcpy((void*) sharp_spec->sbuf(),
 	   (const void*) tensor.tensor_data().data(),
 	   tensor.tensor_data().size());
   }
 
   GPU_EVENT_IF_CUDA ready_event = RecordReadyEvent(context);
 
-  OpTableEntry* e = malloc(sizeof(OpTableEntry));;
+  OpTableEntry* e = new OpTableEntry();
   e->context = context;
   e->tensor = tensor;
   e->output = output;
   e->event = ready_event;
   e->device = device;
-  e->callback = callbck;
+  e->callback = callback;
   e->spec = sharp_spec;
   e->idx = idx;
 
@@ -2163,7 +2075,7 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, const Tensor& tensor,
 
 // MPI must be initialized and the background thread must be running before
 // this function is called.
-void EnqueueTensorAllreduce2(OpKernelContext* context, const Tensor& tensor, 
+void EnqueueTensorAllreduce2(OpKernelContext* context, Tensor& tensor, 
                             Tensor* output, const int32_t& idx,
                             const std::string name, const int device,
                             StatusCallback callback) {
@@ -2275,22 +2187,6 @@ int GetDeviceID(OpKernelContext* context) {
   return device;
 }
 
-// On GPU this event will signal that data is ready, and tensors are
-// allocated.
-GPU_EVENT_IF_CUDA RecordReadyEvent(OpKernelContext* context) {
-#if HAVE_CUDA
-  auto device_context = context->op_device_context();
-  if (device_context != nullptr) {
-    auto executor = device_context->stream()->parent();
-    GPU_EVENT_IF_CUDA ready_event = new perftools::gputools::Event(executor);
-    ready_event->Init();
-    device_context->stream()->ThenRecordEvent(ready_event);
-    return ready_event;
-  }
-#endif
-  return nullptr;
-}
-
 } // namespace tensorflow
 
 class HorovodAllreduceOp : public AsyncOpKernel {
@@ -2364,10 +2260,10 @@ public:
                    context->allocate_output(0, tensor.shape(), &output));
 //    GPU_EVENT_IF_CUDA ready_event = RecordReadyEvent(context);
     EnqueueTensorAllreduce2(context, tensor, output, idx , node_name,
-                           device, [context, done](const Status& status) {
-                             context->SetStatus(status);
-                             done();
-                           });
+                            device, [context, done](const Status& status) {
+                              context->SetStatus(status);
+                              done();
+                            });
   }
 
 private:

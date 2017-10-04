@@ -11,6 +11,7 @@
 #include <string.h>
 #include <assert.h>
 #include <sharp/api/sharp.h>
+#include "tensorflow/stream_executor/stream.h"
 
 #include "tensorflow/core/framework/op_kernel.h"
 
@@ -21,10 +22,10 @@ namespace tensorflow {
 
 class SharpSpec{
 public:
-  SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_  , struct sharp_coll_context ctx_, OpKernelContext* op_ctx);
+  SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_  , struct sharp_coll_context* ctx_, OpKernelContext* op_ctx);
   ~SharpSpec();
 
-  struct sharp_coll_reduce_spec* spec() const;
+  struct sharp_coll_reduce_spec* spec();
   struct sharp_coll_reduce_spec* spec(int len);
   void set_length(int len);
 
@@ -35,7 +36,7 @@ private:
   struct sharp_coll_context *ctx;
   struct sharp_coll_reduce_spec specs;
   PersistentTensor* buffer;
-}
+};
 
 class BufferBank{
  public:
@@ -44,7 +45,7 @@ class BufferBank{
   SharpSpec* request(uint16_t idx);
   void release(uint16_t idx);
   
-  Init(size_t buffer_size_,  struct sharp_coll_context* ctx_ , OpKernelContext* op_ctx_, enum sharp_datatype dtype_);
+  void Init(size_t buffer_size_,  struct sharp_coll_context* ctx_ , OpKernelContext* op_ctx_, enum sharp_datatype dtype_ = SHARP_DTYPE_FLOAT);
   bool isInitiated() const;
  private:
   void expand();

@@ -1,11 +1,14 @@
 #include "buffer_bank.h"
+#include "tensorflow/core/common_runtime/dma_helper.h"
 
 #define PUT_ON_GPU
+
+using perftools::gputools::Stream;
 
 namespace horovod {
 namespace tensorflow {
 
-SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sharp_coll_context ctx_, OpKernelContext* op_ctx): ctx(ctx_){
+SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sharp_coll_context* ctx_, OpKernelContext* op_ctx): ctx(ctx_){
   specs.sbuf_desc.type = SHARP_DATA_BUFFER;
 
 #ifndef PUT_ON_GPU
@@ -31,7 +34,7 @@ SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sha
   if (device_context != nullptr) {
     device_context->stream()->BlockHostUntilDone();
   }
-  buf = buffer->AccessTensor(first_entry.context)->tensor_data().data();
+  void* buf = DMAHelper::base(buffer->AccessTensor(op_ctx));
 #endif
 #endif
 
@@ -64,16 +67,16 @@ SharpSpec::~SharpSpec(){
 #endif
 }
 
-struct sharp_coll_reduce_spec* SharpSpec::spec() const{
+struct sharp_coll_reduce_spec* SharpSpec::spec(){
   return &specs;
 }
 
-struct sharp_coll_reduce_spec* SharpSpec::spec(int len) const{
+struct sharp_coll_reduce_spec* SharpSpec::spec(int len){
   specs.length = len;
   return &specs;
 }
 
-void SharpSpec::set_length(int len) const{
+void SharpSpec::set_length(int len){
   specs.length = len;
 }
 
@@ -89,7 +92,7 @@ void* SharpSpec::rbuf() const{
 
 BufferBank::BufferBank(): buffer_size(0), count(0), buffers(), freelist(), map(), initiated(false){}
 
-BufferBank::Init(size_t buffer_size_,  struct sharp_coll_context* ctx_, OpKernelContext* op_ctx_ , enum sharp_datatype dtype_ = SHARP_DTYPE_FLOAT){
+void BufferBank::Init(size_t buffer_size_,  struct sharp_coll_context* ctx_, OpKernelContext* op_ctx_ , enum sharp_datatype dtype_){
   buffer_size = buffer_size_;
   ctx = ctx_;
   op_ctx = op_ctx_;
@@ -107,8 +110,8 @@ SharpSpec* BufferBank::request(uint16_t idx){
   return buffers[next_free];
 }
 
-SharpSpec* BufferBank::expand(){
-  SharpSpec* new_spec = new SharpSpec(buffer_size , ctx, op_ctx);
+void BufferBank::expand(){
+  SharpSpec* new_spec = new SharpSpec(buffer_size , dtype , ctx, op_ctx);
   buffers.insert(buffers.end(), new_spec);
   freelist.push(count);
   ++count;
