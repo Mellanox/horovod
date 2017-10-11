@@ -1391,6 +1391,107 @@ void CheckForStalledTensors(HorovodGlobalState& state) {
 
 #ifdef HAVE_SHARP
 
+int oob_bcast(void *comm_context, void *buf, int size, int root)
+{
+
+	MPI_Bcast(buf, size, MPI_BYTE, root, MPI_COMM_WORLD);
+	return 0;
+}
+
+int oob_barrier(void *comm_context)
+{
+	MPI_Barrier(MPI_COMM_WORLD);
+	return 0;
+}
+int oob_gather(void *comm_context, int root, void *sbuf, void *rbuf, int len)
+{
+	MPI_Gather(sbuf, len, MPI_BYTE, rbuf, len, MPI_BYTE, root, MPI_COMM_WORLD);
+	return 0;
+}
+
+static char *get_host_name(void)
+{
+    static char hostname[256] = {0};
+
+    if (*hostname == 0) {
+        gethostname(hostname, sizeof(hostname));
+        strtok(hostname, ".");
+    }
+    return hostname;
+}
+
+
+int pciMatch(char* A, char* B) {  //Taken as is 
+  char* a = A;
+  char* b = B;
+  int match = 0;
+  while ((*a) && (*b) && (*a)==(*b)) {
+    ++match;
+  }
+  return match;
+}
+
+#define PCI_MAX_MATCH 100
+
+char* getClosestNicName(){
+  char* gpuBusId = new char[PCI_MAX_MATCH];
+  cudaError_t res =  cudaDeviceGetPCIBusId( gpuBusId, PCI_MAX_MATCH, 0 );
+  if (res != cudaSuccess){
+    printf("cudaDeviceGetPCIBusId failed\n");
+  }
+
+  return gpuBusId;
+
+}
+
+int InitSharp(){
+  int ret = 0;
+  struct sharp_coll_init_spec init_spec = {0};
+  struct sharp_coll_comm_init_spec comm_spec;
+  //struct timeval tval;
+  init_spec.progress_func  = NULL;
+  /* coverity[dont_call] */
+  init_spec.job_id = (gethostid() << 32) | rand();
+  init_spec.hostlist = get_host_name();
+  init_spec.world_rank = 0;
+  init_spec.world_size = 1;
+  init_spec.oob_colls.barrier = oob_barrier;
+  init_spec.oob_colls.bcast = oob_bcast;
+  init_spec.oob_colls.gather = oob_gather;
+  init_spec.config = sharp_coll_default_config;
+
+  init_spec.config.ib_dev_list = getClosestNicName(); 
+
+  printf("device = %s\n",init_spec.config.ib_dev_list);
+
+  return -1;
+
+
+
+  /* initialize sharp coll */
+  
+  ret = sharp_coll_init(&init_spec, &(horovod_global.sharp_context));
+  if (ret < 0) {
+    fprintf(stderr, "sharp_coll_init failed: %s\n", sharp_coll_strerror(ret));
+    return ret;
+  }
+  /* create sharp group */
+  comm_spec.rank = 0;
+  comm_spec.size = 1;
+  comm_spec.is_comm_world = 1;
+  comm_spec.oob_ctx = NULL;
+  ret = sharp_coll_comm_init((horovod_global.sharp_context), &comm_spec, &(horovod_global.sharp_comm));
+  if (ret < 0) {
+    fprintf(stderr, "sharp communicator creation failed: %s\n", sharp_coll_strerror(ret));
+    sharp_coll_finalize(horovod_global.sharp_context);
+    return ret;
+  }
+  /* destroy group */
+  sharp_coll_comm_destroy((horovod_global.sharp_comm));
+  sharp_coll_finalize(horovod_global.sharp_context);
+  return ret;
+}
+
 void Send_Sharp(HorovodGlobalState& state){
   std::list<OpTableEntry*>& list = state.setup_list;
   int res;
@@ -1496,6 +1597,22 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   MPI_Comm_size(MPI_COMM_WORLD, &size);
 
   printf("Comm size = %d\n", size);
+
+
+#if HAVE_SHARP
+    int ret = InitSharp();
+    if (ret>=0){
+      auto sharp_threshold = std::getenv("HOROVOD_SHARP_THRESHOLD");
+      if (sharp_threshold != nullptr) {
+	horovod_global.sharp_thresh = size_t(std::atol(sharp_threshold));
+      } else {
+        horovod_global.sharp_thresh = 256;
+      }
+    } else {
+      horovod_global.sharp_thresh = 0;
+      printf("Sharp thresh set to 0. Sharp is not being used\n");
+    }
+#endif
 
   // Determine local rank by querying the local communicator.
   MPI_Comm local_comm;
@@ -1758,131 +1875,12 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
 }
 
 
-#if HAVE_SHARP
-
-static int oob_bcast(void *comm_context, void *buf, int size, int root)
-{
-        return 0;
-}
-
-static int oob_barrier(void *comm_context)
-{
-        return 0;
-}
-
-static int oob_gather(void *comm_context, int root, void *sbuf, void *rbuf, int len)
-{
-        memcpy(rbuf, sbuf, len);
-        return 0;
-}
-
-static char *get_host_name(void)
-{
-    static char hostname[256] = {0};
-
-    if (*hostname == 0) {
-        gethostname(hostname, sizeof(hostname));
-        strtok(hostname, ".");
-    }
-    return hostname;
-}
-
-
-int pciMatch(char* A, char* B) {  //Taken as is 
-  char* a = A;
-  char* b = B;
-  int match = 0;
-  while ((*a) && (*b) && (*a)==(*b)) {
-    ++match;
-  }
-  return match;
-}
-
-#define PCI_MAX_MATCH 100
-
-char* getClosestNicName(){
-  char* gpuBusId = new char[PCI_MAX_MATCH];
-  cudaError_t res =  cudaDeviceGetPCIBusId( gpuBusId, PCI_MAX_MATCH, 0 );
-  if (res != cudaSuccess){
-    printf("cudaDeviceGetPCIBusId failed\n");
-  }
-
-  return gpuBusId;
-
-}
-
-
-
-int InitSharp(){
-  int ret = 0;
-  struct sharp_coll_init_spec init_spec = {0};
-  struct sharp_coll_comm_init_spec comm_spec;
-  //struct timeval tval;
-  init_spec.progress_func  = NULL;
-  /* coverity[dont_call] */
-  init_spec.job_id = (gethostid() << 32) | rand();
-  init_spec.hostlist = get_host_name();
-  init_spec.world_rank = 0;
-  init_spec.world_size = 1;
-  init_spec.oob_colls.barrier = oob_barrier;
-  init_spec.oob_colls.bcast = oob_bcast;
-  init_spec.oob_colls.gather = oob_gather;
-  init_spec.config = sharp_coll_default_config;
-
-  init_spec.config.ib_dev_list = getClosestNicName(); 
-
-  printf("device = %s\n",init_spec.config.ib_dev_list);
-
-  return -1;
-
-
-
-  /* initialize sharp coll */
-  
-  ret = sharp_coll_init(&init_spec, &(horovod_global.sharp_context));
-  if (ret < 0) {
-    fprintf(stderr, "sharp_coll_init failed: %s\n", sharp_coll_strerror(ret));
-    return ret;
-  }
-  /* create sharp group */
-  comm_spec.rank = 0;
-  comm_spec.size = 1;
-  comm_spec.is_comm_world = 1;
-  comm_spec.oob_ctx = NULL;
-  ret = sharp_coll_comm_init((horovod_global.sharp_context), &comm_spec, &(horovod_global.sharp_comm));
-  if (ret < 0) {
-    fprintf(stderr, "sharp communicator creation failed: %s\n", sharp_coll_strerror(ret));
-    sharp_coll_finalize(horovod_global.sharp_context);
-    return ret;
-  }
-  /* destroy group */
-  sharp_coll_comm_destroy((horovod_global.sharp_comm));
-  sharp_coll_finalize(horovod_global.sharp_context);
-  return ret;
-}
-
-#endif
 
 // Start Horovod background thread. Ensure that this is
 // only done once no matter how many times this function is called.
 void InitializeHorovodOnce() {
   // Ensure background thread is only started once.
   if (!horovod_global.initialize_flag.test_and_set()) {
-#if HAVE_SHARP
-    int ret = InitSharp();
-    if (ret>=0){
-      auto sharp_threshold = std::getenv("HOROVOD_SHARP_THRESHOLD");
-      if (sharp_threshold != nullptr) {
-	horovod_global.sharp_thresh = size_t(std::atol(sharp_threshold));
-      } else {
-        horovod_global.sharp_thresh = 256;
-      }
-    } else {
-      horovod_global.sharp_thresh = 0;
-      printf("Sharp thresh set to 0. Sharp is not being used\n");
-    }
-
-    #endif
     horovod_global.background_thread =
         std::thread(BackgroundThreadLoop, std::ref(horovod_global));
   }
