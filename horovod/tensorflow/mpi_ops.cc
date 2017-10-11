@@ -1445,6 +1445,9 @@ char* getClosestNicName(){
 }
 
 int InitSharp(){
+
+  printf("Initiating Sharp...\n");
+
   int ret = 0;
   struct sharp_coll_init_spec init_spec = {0};
   struct sharp_coll_comm_init_spec comm_spec;
@@ -1486,10 +1489,20 @@ int InitSharp(){
     sharp_coll_finalize(horovod_global.sharp_context);
     return ret;
   }
+
+
+  printf("Sharp Initiated\n");
+
   /* destroy group */
-  sharp_coll_comm_destroy((horovod_global.sharp_comm));
-  sharp_coll_finalize(horovod_global.sharp_context);
   return ret;
+}
+
+void CleanSharp(HorovodGlobalState& state){
+  /* destroy group */
+  sharp_coll_comm_destroy(state.sharp_comm);
+  sharp_coll_finalize(state.sharp_context);
+  printf("Sharp Destroyed\n");
+
 }
 
 void Send_Sharp(HorovodGlobalState& state){
@@ -1497,6 +1510,8 @@ void Send_Sharp(HorovodGlobalState& state){
   int res;
  
   //Check for device-to-device copy event completion on GPU, and put the completed in the tempQ.
+  
+  printf("Checking device-to-device copies:\n");
   std::queue<OpTableEntry*> tempQ;
   {
     std::lock_guard<std::mutex> guard(state.sharp_mutex);
@@ -1512,12 +1527,16 @@ void Send_Sharp(HorovodGlobalState& state){
   }
 
   //Go over the tempQ and send sharp.
+
+  printf("Doing sharp sends:\n");
   while(!tempQ.empty()){
-     OpTableEntry* entry = tempQ.front();
-     tempQ.pop();
-     size_t len = entry->tensor.tensor_data().size(); 
-     SHARP_CHECK(entry, "sharp allreduce nb", sharp_coll_do_allreduce_nb(state.sharp_comm, entry->spec->spec(len), &(entry->sharp_handle))  )
-     state.sharp_list.push_front(entry);
+    OpTableEntry* entry = tempQ.front();
+    tempQ.pop();
+    size_t len = entry->tensor.tensor_data().size(); 
+    printf("Tensor %d: Done GPU2GPU, sending SHARP\n", entry->idx);
+    //TODO: Add index 
+    SHARP_CHECK(entry, "sharp allreduce nb", sharp_coll_do_allreduce_nb(state.sharp_comm, entry->spec->spec(len), &(entry->sharp_handle)))
+    state.sharp_list.push_front(entry);
   }
 
   //Sharp progress
@@ -1527,14 +1546,17 @@ void Send_Sharp(HorovodGlobalState& state){
     return;
   }
 
+  printf("Sharp Progressed\n");
+
   std::list<OpTableEntry*>& sharp_list = state.sharp_list;
 
-
   // check for Sharp completion, and async pass data from sharp rbuf back to the GPU buffer.
+
   for (std::list<OpTableEntry*>::iterator it = sharp_list.begin(); it != sharp_list.end(); ++it){
     OpTableEntry* entry = (*it);
     res = sharp_coll_req_test(entry->sharp_handle);
     if (res){
+      printf("Tensor %d: Sharp Completed\n", entry->idx);
       SHARP_CHECK(entry, "Sharp Request Free" , sharp_coll_req_free(entry->sharp_handle))
       auto device_context = entry->context->op_device_context();
       assert(device_context != nullptr); 
@@ -1560,13 +1582,14 @@ void Send_Sharp(HorovodGlobalState& state){
     }
   }
 
-  std::list<OpTableEntry*>& flist = state.sharp_list;
+  std::list<OpTableEntry*>& flist = state.final_list;
 
 
   //check for data copy events completion, free resources, and call callback
   for (std::list<OpTableEntry*>::iterator it = flist.begin(); it != flist.end(); ++it){
     OpTableEntry* entry = (*it);
     if (!entry->event || entry->event->PollForStatus() != perftools::gputools::Event::Status::kPending){
+      printf("Tensor %d: Allreduce Completed!\n", entry->idx);
       entry->callback(Status::OK());
       free(entry);
       it = list.erase(it);
@@ -1574,8 +1597,6 @@ void Send_Sharp(HorovodGlobalState& state){
       ++it;
     }
   }
-
-
 }
 
 
@@ -2013,15 +2034,23 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, Tensor& tensor,
 // first, I am passing the data to the buffers registered to sharp_reg_mr
 // We plan for the case they are on the GPU.
 // TODO: Check if we can change the allocation attributes to have the tensor ready on registered space.
+
+  printf("Adding Tensor index %d\n", idx);
+
   SharpSpec* sharp_spec;
   BufferBank& bank = horovod_global.bank;
   {
     std::lock_guard<std::mutex> guard(horovod_global.bank_mutex);
     if (!bank.isInitiated()){
+      printf("Initiating Bank\n");
       bank.Init(horovod_global.sharp_thresh, horovod_global.sharp_context, context, SHARP_DTYPE_FLOAT);
     } 
     sharp_spec = bank.request(idx);
   }
+  printf("Tensor %d Got specs\n", idx);
+
+
+  
  
 #if HAVE_CUDA
   if (device != CPU_DEVICE_ID) 
@@ -2045,7 +2074,7 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, Tensor& tensor,
       stream->ThenMemcpy(&gpu_dst_ptr, gpu_src_ptr, tsize);
 #endif
     }
-  } 
+  }
   else 
 #endif
   {
@@ -2053,6 +2082,9 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, Tensor& tensor,
 	   (const void*) tensor.tensor_data().data(),
 	   tensor.tensor_data().size());
   }
+
+  printf("Tensor %d Async memcpy in GPU triggered\n", idx);
+
 
   GPU_EVENT_IF_CUDA ready_event = RecordReadyEvent(context);
 
@@ -2065,6 +2097,9 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, Tensor& tensor,
   e->callback = callback;
   e->spec = sharp_spec;
   e->idx = idx;
+
+
+  printf("Tensor %d OpTableEntry created\n", idx);
 
   std::lock_guard<std::mutex> guard(horovod_global.sharp_mutex);
   horovod_global.setup_list.push_front(e);

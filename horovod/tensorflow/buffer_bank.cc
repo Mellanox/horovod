@@ -11,6 +11,8 @@ namespace tensorflow {
 SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sharp_coll_context* ctx_, OpKernelContext* op_ctx): ctx(ctx_){
   specs.sbuf_desc.type = SHARP_DATA_BUFFER;
 
+  printf("Allocating new sharp spec...\n");
+
 #ifndef PUT_ON_GPU
   void* buf = (void*) malloc(buffer_size_ * sizeof(char));  //TODO: Put on GPU
 #else
@@ -22,6 +24,9 @@ SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sha
   Tensor* tensor;
   Status status = op_ctx->allocate_persistent(
       DT_INT8, buffer_shape, buffer, &tensor);
+
+  printf("PersistentTensor Allocated for sharp\n");
+
   if (!status.ok()) {
     printf("Persistent Tensor Allocation Failed!\n");
     return;
@@ -40,6 +45,9 @@ SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sha
 
   specs.sbuf_desc.buffer.ptr = buf;
   int res = sharp_coll_reg_mr(ctx_, buf, buffer_size_, &specs.sbuf_desc.buffer.mem_handle);
+
+  printf("GPU Buffer registered with SHARP\n");
+
   specs.sbuf_desc.buffer.length = buffer_size_;
   if (res < 0){
      free(buf);
