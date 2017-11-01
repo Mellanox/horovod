@@ -1444,7 +1444,7 @@ char* getClosestNicName(){
 
 }
 
-int InitSharp(){
+int InitSharp(int rank, int size){
 
   printf("Initiating Sharp...\n");
 
@@ -1456,14 +1456,15 @@ int InitSharp(){
   /* coverity[dont_call] */
   init_spec.job_id = (gethostid() << 32) | rand();
   init_spec.hostlist = get_host_name();
-  init_spec.world_rank = 0;
-  init_spec.world_size = 1;
+  init_spec.world_rank = rank;
+  init_spec.world_size = size;
   init_spec.oob_colls.barrier = oob_barrier;
   init_spec.oob_colls.bcast = oob_bcast;
   init_spec.oob_colls.gather = oob_gather;
   init_spec.config = sharp_coll_default_config;
 
-  init_spec.config.ib_dev_list = getClosestNicName(); 
+//  init_spec.config.ib_dev_list = getClosestNicName(); 
+  init_spec.config.ib_dev_list = "mlx5_1:1";  
 
   printf("device = %s\n",init_spec.config.ib_dev_list);
 
@@ -1606,6 +1607,8 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   // Initialize MPI. This must happen on the background thread, since not all
   // MPI implementations support being called from multiple threads.
 
+  printf("Yaniv: Initiating MPI\n");
+
   MPI_Init(NULL, NULL);
 
   // Get MPI rank to determine if we are rank zero.
@@ -1617,11 +1620,11 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   int size;
   MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-  printf("Comm size = %d\n", size);
+  printf("Yaniv: Comm size = %d\n", size);
 
 
 #if HAVE_SHARP
-    int ret = InitSharp();
+    int ret = InitSharp(rank,size);
     if (ret>=0){
       auto sharp_threshold = std::getenv("HOROVOD_SHARP_THRESHOLD");
       if (sharp_threshold != nullptr) {
