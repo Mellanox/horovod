@@ -1606,8 +1606,11 @@ void Send_Sharp(HorovodGlobalState& state){
 void BackgroundThreadLoop(HorovodGlobalState& state) {
   // Initialize MPI. This must happen on the background thread, since not all
   // MPI implementations support being called from multiple threads.
-
+  assert(0);
   printf("Yaniv: Initiating MPI\n");
+
+  int x= 5;
+  
 
   MPI_Init(NULL, NULL);
 
