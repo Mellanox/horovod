@@ -70,7 +70,7 @@ def _load_ctypes_dll(name):
 
 
 MPI_LIB = _load_library('mpi_lib' + _get_ext_suffix(),
-                        ['HorovodAllgather', 'HorovodAllreduce'])
+                        ['HorovodAllgather', 'HorovodAllreduce2'])
 
 
 MPI_LIB_CTYPES = _load_ctypes_dll('mpi_lib' + _get_ext_suffix())
@@ -148,6 +148,7 @@ def _allreduce(tensor, name=None):
     return MPI_LIB.horovod_allreduce(tensor, name=name)
 
 
+ops.NotDifferentiable('HorovodAllreduce')
 
 def _allreduce2(tensor, name=None):
     """An op which sums an input tensor over all the Horovod processes.
@@ -166,8 +167,7 @@ def _allreduce2(tensor, name=None):
     reduce_counter=reduce_counter+1
     return MPI_LIB.horovod_allreduce2(tensor, name=name, idx=reduce_counter)
 
-ops.NotDifferentiable('HorovodAllreduce')
-
+ops.NotDifferentiable('HorovodAllreduce2')
 
 def allgather(tensor, name=None):
     """An op which concatenates the input tensor with the same input tensor on

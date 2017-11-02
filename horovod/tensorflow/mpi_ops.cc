@@ -42,6 +42,8 @@ dub dub
 
 #if HAVE_NCCL
 #include <nccl.h>
+#else
+   bummer
 #endif
 
 #if HAVE_SHARP
@@ -1144,6 +1146,8 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
       finalizer_thread.detach();
       return;
     }
+#else
+   O_o
 #endif
 
     MPI_Datatype dtype;

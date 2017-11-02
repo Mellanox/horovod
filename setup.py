@@ -245,6 +245,11 @@ def get_nccl_dirs(build_ext, cuda_include_dirs, cuda_lib_dirs):
         nccl_lib_dirs += [nccl_lib]
 
     try:
+        print(nccl_include_dirs)
+        print(cuda_include_dirs)
+        print(nccl_home)
+        print(cuda_lib_dirs)
+        print("Testing nccl.............................................")
         test_compile(build_ext, 'test_nccl', libraries=['nccl'], include_dirs=nccl_include_dirs + cuda_include_dirs,
                      library_dirs=nccl_lib_dirs + cuda_lib_dirs, code=textwrap.dedent('''\
             #include <nccl.h>
