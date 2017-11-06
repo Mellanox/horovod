@@ -356,7 +356,7 @@ def fully_define_extension(build_ext):
         MACROS += [('HAVE_SHARP', '1')]
         INCLUDES += sharp_include_dirs
         LIBRARY_DIRS += sharp_lib_dirs
-        LIBRARIES = ['sharp_coll']
+        LIBRARIES += ['sharp_coll']
 
 
     if gpu_allreduce:

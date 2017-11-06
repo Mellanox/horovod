@@ -10,6 +10,7 @@ namespace tensorflow {
 
 SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sharp_coll_context* ctx_, OpKernelContext* op_ctx): ctx(ctx_){
   specs.sbuf_desc.type = SHARP_DATA_BUFFER;
+  specs.rbuf_desc.type = SHARP_DATA_BUFFER;
 
   printf("Allocating new sharp spec...\n");
 
@@ -43,10 +44,12 @@ SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sha
 #endif
 #endif
 
-  specs.sbuf_desc.buffer.ptr = buf;
-  int res = sharp_coll_reg_mr(ctx_, buf, buffer_size_, &specs.sbuf_desc.buffer.mem_handle);
+  int byte_size = buffer_size_ * sizeof(float);
 
-  printf("GPU Buffer registered with SHARP\n");
+  specs.sbuf_desc.buffer.ptr = buf;
+  int res = sharp_coll_reg_mr(ctx_, buf, byte_size , &specs.sbuf_desc.buffer.mem_handle);
+
+  printf("GPU Buffer registered with SHARP, affr = %d, size = %d\n", buf, buffer_size_);
 
   specs.sbuf_desc.buffer.length = buffer_size_;
   if (res < 0){
@@ -56,7 +59,7 @@ SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sha
   }
   //specs.rbuf_desc = specs.sbuf_desc; //in place
   
-  specs.rbuf_desc.buffer.ptr = (void*) malloc(buffer_size_ * sizeof(char));
+  specs.rbuf_desc.buffer.ptr = (void*) malloc(byte_size);
   specs.root = 0; //ignored
   specs.dtype = dtype_;
   specs.length = -1;
@@ -114,6 +117,7 @@ SharpSpec* BufferBank::request(uint16_t idx){
   }
   size_t next_free = freelist.front();
   freelist.pop();
+  printf("buffer %d being used\n", next_free);
   map[idx] = next_free;
   return buffers[next_free];
 }
@@ -129,6 +133,7 @@ void BufferBank::release(uint16_t idx){
   std::map<uint16_t, size_t>::iterator it = map.find(idx);
   size_t buf_num = it->second;
   freelist.push(buf_num);
+  printf("buffer %d released\n", buf_num);
   map.erase(it);
 }
 
