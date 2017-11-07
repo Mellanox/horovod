@@ -11,14 +11,11 @@ namespace tensorflow {
 SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sharp_coll_context* ctx_, OpKernelContext* op_ctx): ctx(ctx_){
   specs.sbuf_desc.type = SHARP_DATA_BUFFER;
   specs.rbuf_desc.type = SHARP_DATA_BUFFER;
-
   printf("Allocating new sharp spec...\n");
 
 #ifndef PUT_ON_GPU
   void* buf = (void*) malloc(buffer_size_ * sizeof(char));  //TODO: Put on GPU
 #else
-  // Lazily allocate persistent buffer for Tensor Fusion and keep it
-  // forever per device.
   TensorShape buffer_shape;
   buffer_shape.AddDim(buffer_size_);
   buffer = new PersistentTensor();
@@ -99,7 +96,9 @@ void* SharpSpec::rbuf() const{
   return specs.rbuf_desc.buffer.ptr;
 }
 
-
+cudaStream_t* SharpSpec::stream(){
+  return &mstream;
+}
 
 BufferBank::BufferBank(): buffer_size(0), count(0), buffers(), freelist(), map(), initiated(false){}
 
@@ -146,4 +145,5 @@ BufferBank::~BufferBank(){
 bool BufferBank::isInitiated() const{
   return initiated;
 }
+
 }}

@@ -15,6 +15,7 @@
 
 #include "tensorflow/core/framework/op_kernel.h"
 
+#include <cuda_runtime.h>
 
 namespace horovod {
 namespace tensorflow {
@@ -32,10 +33,14 @@ public:
   void* rbuf() const;
   void* sbuf() const;
 
+  cudaStream_t* stream();
+
 private:
   struct sharp_coll_context *ctx;
   struct sharp_coll_reduce_spec specs;
   PersistentTensor* buffer;
+
+  cudaStream_t mstream;
 };
 
 class BufferBank{
@@ -47,6 +52,7 @@ class BufferBank{
   
   void Init(size_t buffer_size_,  struct sharp_coll_context* ctx_ , OpKernelContext* op_ctx_, enum sharp_datatype dtype_ = SHARP_DTYPE_FLOAT);
   bool isInitiated() const;
+
  private:
   void expand();
   size_t buffer_size;  
@@ -60,7 +66,6 @@ class BufferBank{
 
   OpKernelContext* op_ctx;
   bool initiated;
-
 };
 
 

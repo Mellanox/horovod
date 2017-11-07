@@ -1522,7 +1522,7 @@ void Send_Sharp(HorovodGlobalState& state){
     std::lock_guard<std::mutex> guard(state.sharp_mutex);
     for (std::list<OpTableEntry*>::iterator it = list.begin(); it != list.end(); ++it){
       OpTableEntry* entry = (*it);
-      if (entry->event->PollForStatus() != perftools::gputools::Event::Status::kPending){
+      if (!entry->event || entry->event->PollForStatus() != perftools::gputools::Event::Status::kPending){
         tempQ.push(entry);
         it = list.erase(it);
       } else {
@@ -2012,6 +2012,7 @@ void EnqueueTensorAllreduce(OpKernelContext* context, const Tensor& tensor,
                             Tensor* output, GPU_EVENT_IF_CUDA ready_event,
                             const std::string name, const int device,
                             StatusCallback callback) {
+
   MPIDataType dtype;
   Status status = DataTypeToMPIType(tensor.dtype(), &dtype);
   if (!status.ok()) {
@@ -2084,19 +2085,22 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, Tensor& tensor,
     {
       auto stream = device_context->stream();
 #if 0
+
       cudaMemcpyAsync((void*) sharp_spec.sbuf() ,
                       (const void*)  tensor.tensor_data().data(),
 		      tensor.tensor_data().size(),
 		      cudaMemcpyDeviceToDevice,
-		      stream);
+		      sharp_spec.stream());
+
 #else
+
       size_t tsize = tensor.tensor_data().size();
       void* src_buf = GetBase(&tensor);
-
       DeviceMemoryBase gpu_src_ptr(src_buf , tsize );
       DeviceMemoryBase gpu_dst_ptr(sharp_spec->sbuf() , tsize );
       stream->ThenMemcpy(&gpu_dst_ptr, gpu_src_ptr, tsize);
-//      printf("Tensor %d Async memcpy in GPU triggered\n", idx);
+      printf("Tensor %d Async memcpy in GPU triggered\n", idx);
+
 #endif
     }
   }
@@ -2138,6 +2142,8 @@ void EnqueueTensorAllreduce2(OpKernelContext* context, Tensor& tensor,
                             Tensor* output, const int32_t& idx,
                             const std::string name, const int device,
                             StatusCallback callback) {
+//printf("device = %d, cpu = %d, thresh = %d, size = %d\n", device, CPU_DEVICE_ID, horovod_global.sharp_thresh, tensor.tensor_data().size());
+
 #ifdef HAVE_SHARP
   if (device != CPU_DEVICE_ID && horovod_global.sharp_thresh >= tensor.tensor_data().size()) 
   {
