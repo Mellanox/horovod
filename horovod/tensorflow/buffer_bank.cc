@@ -2,28 +2,48 @@
 #include "tensorflow/core/common_runtime/dma_helper.h"
 
 #define PUT_ON_GPU
+#define DATA_SIZE 4
+
 
 using perftools::gputools::Stream;
+
+
 
 namespace horovod {
 namespace tensorflow {
 
 SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sharp_coll_context* ctx_, OpKernelContext* op_ctx): ctx(ctx_){
+
+  int byte_size = buffer_size_;
+  int num_elements = byte_size / DATA_SIZE;
+
   specs.sbuf_desc.type = SHARP_DATA_BUFFER;
   specs.rbuf_desc.type = SHARP_DATA_BUFFER;
   printf("Allocating new sharp spec...\n");
 
 #ifndef PUT_ON_GPU
-  void* buf = (void*) malloc(buffer_size_ * sizeof(char));  //TODO: Put on GPU
+  void* buf = (void*) malloc(byte_size * sizeof(char));
 #else
-  TensorShape buffer_shape;
-  buffer_shape.AddDim(buffer_size_);
-  buffer = new PersistentTensor();
-  Tensor* tensor;
-  Status status = op_ctx->allocate_persistent(
-      DT_INT8, buffer_shape, buffer, &tensor);
 
-  printf("PersistentTensor Allocated for sharp\n");
+  TensorShape buffer_shape;
+  buffer_shape.AddDim(num_elements);
+  buffer = new PersistentTensor();
+
+  Tensor* tensor;
+
+  if (!op_ctx){
+    printf("no op context!!!\n");
+  } 
+
+  AllocatorAttributes attr = AllocatorAttributes();
+
+  attr.set_gpu_compatible(true);
+  attr.set_on_host(false);
+  attr.set_nic_compatible(true);
+
+  Status status = op_ctx->allocate_persistent(DT_FLOAT, buffer_shape, buffer, &tensor, attr);
+
+  printf("PersistentTensor Allocated for sharp, size = %d\n", tensor->tensor_data().size());
 
   if (!status.ok()) {
     printf("Persistent Tensor Allocation Failed!\n");
@@ -40,8 +60,6 @@ SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sha
   void* buf = DMAHelper::base(buffer->AccessTensor(op_ctx));
 #endif
 #endif
-
-  int byte_size = buffer_size_ * sizeof(float);
 
   specs.sbuf_desc.buffer.ptr = buf;
   int res = sharp_coll_reg_mr(ctx_, buf, byte_size , &specs.sbuf_desc.buffer.mem_handle);
@@ -80,7 +98,7 @@ struct sharp_coll_reduce_spec* SharpSpec::spec(){
 }
 
 struct sharp_coll_reduce_spec* SharpSpec::spec(int len){
-  specs.length = len;
+  specs.length = len/DATA_SIZE;
   return &specs;
 }
 
@@ -116,7 +134,7 @@ SharpSpec* BufferBank::request(uint16_t idx){
   }
   size_t next_free = freelist.front();
   freelist.pop();
-  printf("buffer %d being used\n", next_free);
+//  printf("buffer %d being used\n", next_free);
   map[idx] = next_free;
   return buffers[next_free];
 }
@@ -132,7 +150,7 @@ void BufferBank::release(uint16_t idx){
   std::map<uint16_t, size_t>::iterator it = map.find(idx);
   size_t buf_num = it->second;
   freelist.push(buf_num);
-  printf("buffer %d released\n", buf_num);
+//  printf("buffer %d released\n", buf_num);
   map.erase(it);
 }
 
