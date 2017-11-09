@@ -13,13 +13,11 @@ namespace horovod {
 namespace tensorflow {
 
 SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sharp_coll_context* ctx_, OpKernelContext* op_ctx): ctx(ctx_){
-
   int byte_size = buffer_size_;
   int num_elements = byte_size / DATA_SIZE;
-
   specs.sbuf_desc.type = SHARP_DATA_BUFFER;
   specs.rbuf_desc.type = SHARP_DATA_BUFFER;
-  printf("Allocating new sharp spec...\n");
+//  printf("Allocating new sharp spec...\n");
 
 #ifndef PUT_ON_GPU
   void* buf = (void*) malloc(byte_size * sizeof(char));
@@ -35,15 +33,15 @@ SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sha
     printf("no op context!!!\n");
   } 
 
-  AllocatorAttributes attr = AllocatorAttributes();
+  Status status;
 
+  AllocatorAttributes attr = AllocatorAttributes();
   attr.set_gpu_compatible(true);
   attr.set_on_host(false);
-  attr.set_nic_compatible(true);
+  attr.set_nic_compatible(false);
 
-  Status status = op_ctx->allocate_persistent(DT_FLOAT, buffer_shape, buffer, &tensor, attr);
+  status = op_ctx->allocate_persistent(DT_FLOAT, buffer_shape, buffer, &tensor, attr);
 
-  printf("PersistentTensor Allocated for sharp, size = %d\n", tensor->tensor_data().size());
 
   if (!status.ok()) {
     printf("Persistent Tensor Allocation Failed!\n");
@@ -64,7 +62,7 @@ SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sha
   specs.sbuf_desc.buffer.ptr = buf;
   int res = sharp_coll_reg_mr(ctx_, buf, byte_size , &specs.sbuf_desc.buffer.mem_handle);
 
-  printf("GPU Buffer registered with SHARP, affr = %d, size = %d\n", buf, buffer_size_);
+//  printf("GPU Buffer registered with SHARP, affr = %d, size = %d\n", buf, buffer_size_);
 
   specs.sbuf_desc.buffer.length = buffer_size_;
   if (res < 0){
@@ -120,17 +118,16 @@ cudaStream_t* SharpSpec::stream(){
 
 BufferBank::BufferBank(): buffer_size(0), count(0), buffers(), freelist(), map(), initiated(false){}
 
-void BufferBank::Init(size_t buffer_size_,  struct sharp_coll_context* ctx_, OpKernelContext* op_ctx_ , enum sharp_datatype dtype_){
+void BufferBank::Init(size_t buffer_size_,  struct sharp_coll_context* ctx_, enum sharp_datatype dtype_){
   buffer_size = buffer_size_;
   ctx = ctx_;
-  op_ctx = op_ctx_;
   dtype = dtype_;
   initiated = true;
 }
 
-SharpSpec* BufferBank::request(uint16_t idx){
+SharpSpec* BufferBank::request(uint16_t idx, OpKernelContext* op_ctx){
   if (freelist.empty()){
-    this->expand();
+    this->expand(op_ctx);
   }
   size_t next_free = freelist.front();
   freelist.pop();
@@ -139,7 +136,7 @@ SharpSpec* BufferBank::request(uint16_t idx){
   return buffers[next_free];
 }
 
-void BufferBank::expand(){
+void BufferBank::expand(OpKernelContext* op_ctx){
   SharpSpec* new_spec = new SharpSpec(buffer_size , dtype , ctx, op_ctx);
   buffers.insert(buffers.end(), new_spec);
   freelist.push(count);

@@ -7,6 +7,7 @@
 #include "mpi_message.h"
 #include "timeline.h"
 #include <map>
+#include <thread>
 #include <queue>
 #include <string.h>
 #include <assert.h>
@@ -47,14 +48,14 @@ class BufferBank{
  public:
   BufferBank();
   ~BufferBank();
-  SharpSpec* request(uint16_t idx);
+  SharpSpec* request(uint16_t idx, OpKernelContext* op_ctx);
   void release(uint16_t idx);
   
-  void Init(size_t buffer_size_,  struct sharp_coll_context* ctx_ , OpKernelContext* op_ctx_, enum sharp_datatype dtype_ = SHARP_DTYPE_FLOAT);
+  void Init(size_t buffer_size_,  struct sharp_coll_context* ctx_ , enum sharp_datatype dtype_ = SHARP_DTYPE_FLOAT);
   bool isInitiated() const;
 
  private:
-  void expand();
+  void expand(OpKernelContext* op_ctx);
   size_t buffer_size;  
   size_t count;
   struct sharp_coll_context *ctx;
@@ -64,7 +65,6 @@ class BufferBank{
 
   enum sharp_datatype dtype;
 
-  OpKernelContext* op_ctx;
   bool initiated;
 };
 

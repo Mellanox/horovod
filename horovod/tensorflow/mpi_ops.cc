@@ -830,6 +830,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
       buffer_shape.AddDim((int64)horovod_global.tensor_fusion_threshold);
       buffer = new PersistentTensor();
       Tensor* unused;
+      printf("faral allocated persistent called!\n");
       Status status = first_entry.context->allocate_persistent(
           DT_INT8, buffer_shape, buffer, &unused);
       if (!status.ok()) {
@@ -1418,6 +1419,8 @@ int oob_gather(void *comm_context, int root, void *sbuf, void *rbuf, int len)
 	return 0;
 }
 
+
+
 static char *get_host_name(void)
 {
     static char hostname[256] = {0};
@@ -1429,7 +1432,7 @@ static char *get_host_name(void)
     return hostname;
 }
 
-
+#if 0
 int pciMatch(char* A, char* B) {  //Taken as is 
   char* a = A;
   char* b = B;
@@ -1452,6 +1455,7 @@ char* getClosestNicName(){
   return gpuBusId;
 
 }
+#endif
 
 int InitSharp(int rank, int size,int local_rank){
 
@@ -1715,7 +1719,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   bool should_shut_down = false;
   do {
     // This delay determines thread frequency and MPI message latency
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
     Send_Sharp(state);
 
     // Copy the data structures from global state under this lock.
@@ -1935,6 +1939,10 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   //    ncclCommDestroy(it->second);
   //  }
   //#endif
+
+  CleanSharp(state);
+  printf("Clean Sharp called!\n");
+
   MPI_Finalize();
 
   printf("MPI_Finalize called!\n");
@@ -2088,10 +2096,9 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, Tensor& tensor,
   {
     std::lock_guard<std::mutex> guard(horovod_global.bank_mutex);
     if (!bank.isInitiated()){
-//      printf("Initiating Bank\n");
-      bank.Init(horovod_global.sharp_thresh, horovod_global.sharp_context, context, SHARP_DTYPE_FLOAT);
+      bank.Init(horovod_global.sharp_thresh, horovod_global.sharp_context, SHARP_DTYPE_FLOAT);
     } 
-    sharp_spec = bank.request(idx);
+    sharp_spec = bank.request(idx, context);
   }
   //printf("Tensor %d Got specs\n", idx);
 
@@ -2128,7 +2135,7 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, Tensor& tensor,
   else 
 #endif
   {
-    printf("Tensor %d is not on gpu!\n");
+    printf("Tensor %d is not on gpu!\n", idx );
     memcpy((void*) sharp_spec->sbuf(),
 	   (const void*) tensor.tensor_data().data(),
 	   tensor.tensor_data().size());
@@ -2140,8 +2147,6 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, Tensor& tensor,
   e->context = context;
   e->tensor = tensor;
   e->output = output;
-
-
   e->event = ready_event;
   e->device = device;
   e->callback = callback;
