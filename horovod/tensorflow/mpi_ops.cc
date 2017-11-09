@@ -183,6 +183,8 @@ typedef struct {
 
   uint16_t idx;
 
+  std::string name;
+
 } OpTableEntry;
 
 typedef std::map<uint16_t , OpTableEntry*> TensorIdxTable;
@@ -1537,7 +1539,7 @@ void Send_Sharp(HorovodGlobalState& state){
     }
   }
 
-
+  auto& timeline = horovod_global.timeline;
 
   //Go over the tempQ and send sharp.
 
@@ -1547,6 +1549,8 @@ void Send_Sharp(HorovodGlobalState& state){
     size_t len = entry->tensor.tensor_data().size(); 
     //printf("Tensor %d: Done GPU2GPU, sending SHARP... (seq %d)\n", entry->idx, entry->idx); 
     SHARP_CHECK(entry, "sharp allreduce nb", sharp_coll_do_allreduce_nb(state.sharp_comm, entry->idx, entry->spec->spec(len), &(entry->sharp_handle)))
+    timeline.Start(entry->name, MPIResponse::ResponseType::ALLREDUCE);
+    timeline.ActivityStart(entry->name, "SHARP");
     state.sharp_list.push_front(entry);
   }
 
@@ -1570,6 +1574,9 @@ void Send_Sharp(HorovodGlobalState& state){
     if (res){
       //printf("Tensor %d: Sharp Completed\n", entry->idx);
       SHARP_CHECK(entry, "Sharp Request Free" , sharp_coll_req_free(entry->sharp_handle))
+
+      timeline.ActivityEnd(entry->name);
+
       auto device_context = entry->context->op_device_context();
       assert(device_context != nullptr); 
       auto stream = device_context->stream();
@@ -1588,6 +1595,8 @@ void Send_Sharp(HorovodGlobalState& state){
       entry->event = ready_event;
       state.final_list.push_front(entry);
       it = sharp_list.erase(it);
+      timeline.ActivityStart(entry->name, "HOST TO GPU COPY");
+
     } else {
       ++it;
     }
@@ -1604,10 +1613,15 @@ void Send_Sharp(HorovodGlobalState& state){
     OpTableEntry* entry = (*it);
     if (!entry->event || entry->event->PollForStatus() == perftools::gputools::Event::Status::kComplete){
       //printf("Tensor %d: Allreduce Completed!\n", entry->idx);
+
+      timeline.ActivityEnd(entry->name);
+      timeline.End(entry->name, NULL);
       entry->callback(Status::OK());      
       freeQ.push(entry->idx);
       free(entry);
       it = list.erase(it);
+
+
     } else {
       ++it;
     }
@@ -1623,8 +1637,6 @@ void Send_Sharp(HorovodGlobalState& state){
     }
   }
 
-  //if (state.rank == 0){
-  //}
 }
 
 
@@ -2060,7 +2072,7 @@ void EnqueueTensorAllreduce(OpKernelContext* context, const Tensor& tensor,
 
 void EnqueueTensorSharpAllreduce(OpKernelContext* context, Tensor& tensor,
                             Tensor* output, const int32_t& idx,
-                            const int device,
+                            const std::string name, const int device, 
                             StatusCallback callback) {
 
 
@@ -2135,7 +2147,7 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, Tensor& tensor,
   e->callback = callback;
   e->spec = sharp_spec;
   e->idx = idx;
-
+  e->name = name;
 
 //  printf("Tensor %d OpTableEntry created\n", idx);
 
@@ -2154,7 +2166,7 @@ void EnqueueTensorAllreduce2(OpKernelContext* context, Tensor& tensor,
 #ifdef HAVE_SHARP
   if (device != CPU_DEVICE_ID && horovod_global.sharp_thresh >= tensor.tensor_data().size()) 
   {
-    EnqueueTensorSharpAllreduce(context,tensor,output, idx ,device,callback);
+    EnqueueTensorSharpAllreduce(context,tensor,output, idx , name ,device,callback);
   } 
   else 
 #endif
