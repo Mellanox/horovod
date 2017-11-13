@@ -830,7 +830,6 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
       buffer_shape.AddDim((int64)horovod_global.tensor_fusion_threshold);
       buffer = new PersistentTensor();
       Tensor* unused;
-      printf("faral allocated persistent called!\n");
       Status status = first_entry.context->allocate_persistent(
           DT_INT8, buffer_shape, buffer, &unused);
       if (!status.ok()) {
@@ -1458,9 +1457,6 @@ char* getClosestNicName(){
 #endif
 
 int InitSharp(int rank, int size,int local_rank){
-
-  printf("Initiating Sharp...\n");
-
   int ret = 0;
   struct sharp_coll_init_spec init_spec = {0};
   struct sharp_coll_comm_init_spec comm_spec;
@@ -1479,18 +1475,13 @@ int InitSharp(int rank, int size,int local_rank){
 
   init_spec.config.ib_dev_list = strdup("mlx5_1:1");  
 
-  printf("device = %s\n",init_spec.config.ib_dev_list);
-  printf("host name = %s\n", init_spec.hostlist);
-  /* initialize sharp coll */
-  
+  /* initialize sharp coll */ 
   ret = sharp_coll_init(&init_spec, &(horovod_global.sharp_context));
 
   if (ret < 0) {
     fprintf(stderr, "sharp_coll_init failed: %s\n", sharp_coll_strerror(ret));
     return ret;
   }
-
-  printf("Sharp coll initiated\n");
 
   /* create sharp group */
   comm_spec.rank = rank;
@@ -1504,7 +1495,8 @@ int InitSharp(int rank, int size,int local_rank){
     return ret;
   }
 
-  printf("Sharp comm Initiated\n");
+  if (rank==0) 
+    printf("Sharp Initiated\n");
 
   /* destroy group */
   return ret;
@@ -1514,7 +1506,6 @@ void CleanSharp(HorovodGlobalState& state){
   /* destroy group */
   sharp_coll_comm_destroy(state.sharp_comm);
   sharp_coll_finalize(state.sharp_context);
-  printf("Sharp Destroyed\n");
 }
 
 void Send_Sharp(HorovodGlobalState& state){
@@ -1649,8 +1640,6 @@ void Send_Sharp(HorovodGlobalState& state){
 void BackgroundThreadLoop(HorovodGlobalState& state) {
   // Initialize MPI. This must happen on the background thread, since not all
   // MPI implementations support being called from multiple threads.
-  printf("Yaniv: Initiating MPI\n");
-
   state.cnt =0 ;
   MPI_Init(NULL, NULL);
 
@@ -1663,7 +1652,8 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   int size;
   MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-  printf("Yaniv: Comm size = %d\n", size);
+  if (rank ==0 )
+    printf("Yaniv: Comm size = %d\n", size);
 
   // Determine local rank by querying the local communicator.
   MPI_Comm local_comm;
@@ -1941,11 +1931,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   //#endif
 
   CleanSharp(state);
-  printf("Clean Sharp called!\n");
-
   MPI_Finalize();
-
-  printf("MPI_Finalize called!\n");
 }
 
 
