@@ -1517,8 +1517,6 @@ void CleanSharp(HorovodGlobalState& state){
   sharp_coll_comm_destroy(state.sharp_comm);
   sharp_coll_finalize(state.sharp_context);
 
-
-
 }
 
 void Send_Sharp(HorovodGlobalState& state){
