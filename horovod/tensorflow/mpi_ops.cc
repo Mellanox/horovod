@@ -292,6 +292,9 @@ struct HorovodGlobalState {
   struct sharp_coll_comm* sharp_comm;
 
   int cnt;
+
+  std::queue<void*> handles_poll;
+
 #endif
 
 // We reuse CUDA events as it appears that their creation carries non-zero cost.
@@ -1504,8 +1507,18 @@ int InitSharp(int rank, int size,int local_rank){
 
 void CleanSharp(HorovodGlobalState& state){
   /* destroy group */
+
+  std::queue<void*>& handlesQ = state.handles_poll;
+  while (!handlesQ.empty()){
+    void* handle = handlesQ.front();
+    handlesQ.pop();
+    sharp_coll_req_free(handle);
+  }
   sharp_coll_comm_destroy(state.sharp_comm);
   sharp_coll_finalize(state.sharp_context);
+
+
+
 }
 
 void Send_Sharp(HorovodGlobalState& state){
@@ -1513,6 +1526,8 @@ void Send_Sharp(HorovodGlobalState& state){
   int res;
 
   state.cnt++;
+
+  std::queue<void*>& handlesQ = state.handles_poll;
 
   //if (state.rank == 0){
   //}
@@ -1543,6 +1558,10 @@ void Send_Sharp(HorovodGlobalState& state){
     tempQ.pop();
     size_t len = entry->tensor.tensor_data().size(); 
     //printf("Tensor %d: Done GPU2GPU, sending SHARP... (seq %d)\n", entry->idx, entry->idx); 
+    if (!handlesQ.empty()){
+      entry->sharp_handle = handlesQ.front();
+      handlesQ.pop();
+    }
     SHARP_CHECK(entry, "sharp allreduce nb", sharp_coll_do_allreduce_nb(state.sharp_comm, entry->idx, entry->spec->spec(len), &(entry->sharp_handle)))
     timeline.Start(entry->name, MPIResponse::ResponseType::ALLREDUCE);
     timeline.ActivityStart(entry->name, "SHARP");
@@ -1568,10 +1587,9 @@ void Send_Sharp(HorovodGlobalState& state){
     res = sharp_coll_req_test(entry->sharp_handle);
     if (res){
       //printf("Tensor %d: Sharp Completed\n", entry->idx);
-      SHARP_CHECK(entry, "Sharp Request Free" , sharp_coll_req_free(entry->sharp_handle))
-
+      //SHARP_CHECK(entry, "Sharp Request Free" , sharp_coll_req_free(entry->sharp_handle))
+      handlesQ.push(entry->sharp_handle);
       timeline.ActivityEnd(entry->name);
-
       auto device_context = entry->context->op_device_context();
       assert(device_context != nullptr); 
       auto stream = device_context->stream();
@@ -1604,18 +1622,19 @@ void Send_Sharp(HorovodGlobalState& state){
   //check for data copy events completion, free resources, and call callback
   std::queue<uint16_t>& freeQ = state.free_queue;
 
+
+
   for (std::list<OpTableEntry*>::iterator it = flist.begin(); it != flist.end();){
     OpTableEntry* entry = (*it);
     if (!entry->event || entry->event->PollForStatus() == perftools::gputools::Event::Status::kComplete){
       //printf("Tensor %d: Allreduce Completed!\n", entry->idx);
-
+      
       timeline.ActivityEnd(entry->name);
       timeline.End(entry->name, NULL);
-      entry->callback(Status::OK());      
+      entry->callback(Status::OK());
       freeQ.push(entry->idx);
       free(entry);
       it = list.erase(it);
-
 
     } else {
       ++it;
@@ -2070,13 +2089,6 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, Tensor& tensor,
                             StatusCallback callback) {
 
 
-
-// first, I am passing the data to the buffers registered to sharp_reg_mr
-// We plan for the case they are on the GPU.
-// TODO: Check if we can change the allocation attributes to have the tensor ready on registered space.
-
-  //printf("Adding Tensor index %d\n", idx);
-
   SharpSpec* sharp_spec;
   BufferBank& bank = horovod_global.bank;
   {
@@ -2086,11 +2098,7 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, Tensor& tensor,
     } 
     sharp_spec = bank.request(idx, context);
   }
-  //printf("Tensor %d Got specs\n", idx);
 
-
-  
- 
 #if HAVE_CUDA
   if (device != CPU_DEVICE_ID) 
   {
