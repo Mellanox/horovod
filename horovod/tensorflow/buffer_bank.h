@@ -31,6 +31,8 @@ public:
   struct sharp_coll_reduce_spec* spec(int len);
   void set_length(int len);
 
+  void setDest(void* dst);
+
   void* rbuf() const;
   void* sbuf() const;
 

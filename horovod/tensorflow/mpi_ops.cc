@@ -1526,13 +1526,7 @@ void Send_Sharp(HorovodGlobalState& state){
   state.cnt++;
 
   std::queue<void*>& handlesQ = state.handles_poll;
-
-  //if (state.rank == 0){
-  //}
- 
-  //Check for device-to-device copy event completion on GPU, and put the completed in the tempQ.
   
-  //printf("Checking device-to-device copies:\n");
   std::queue<OpTableEntry*> tempQ;
   {
     std::lock_guard<std::mutex> guard(state.sharp_mutex);
@@ -1549,6 +1543,7 @@ void Send_Sharp(HorovodGlobalState& state){
 
   auto& timeline = horovod_global.timeline;
 
+  std::list<OpTableEntry*>& sharp_list = state.sharp_list;
   //Go over the tempQ and send sharp.
 
   while(!tempQ.empty()){
@@ -1563,7 +1558,7 @@ void Send_Sharp(HorovodGlobalState& state){
     SHARP_CHECK(entry, "sharp allreduce nb", sharp_coll_do_allreduce_nb(state.sharp_comm, entry->idx, entry->spec->spec(len), &(entry->sharp_handle)))
     timeline.Start(entry->name, MPIResponse::ResponseType::ALLREDUCE);
     timeline.ActivityStart(entry->name, "SHARP");
-    state.sharp_list.push_front(entry);
+    sharp_list.push_front(entry);
   }
 
   //Sharp progress
@@ -1573,73 +1568,24 @@ void Send_Sharp(HorovodGlobalState& state){
     return;
   }
 
-
-  //printf("Sharp Progressed\n");
-
-  std::list<OpTableEntry*>& sharp_list = state.sharp_list;
-
-  // check for Sharp completion, and async pass data from sharp rbuf back to the GPU buffer.
+  std::queue<uint16_t>& freeQ = state.free_queue;
 
   for (std::list<OpTableEntry*>::iterator it = sharp_list.begin(); it != sharp_list.end();){
     OpTableEntry* entry = (*it);
     res = sharp_coll_req_test(entry->sharp_handle);
     if (res){
-      //printf("Tensor %d: Sharp Completed\n", entry->idx);
-      //SHARP_CHECK(entry, "Sharp Request Free" , sharp_coll_req_free(entry->sharp_handle))
       handlesQ.push(entry->sharp_handle);
-      timeline.ActivityEnd(entry->name);
-      auto device_context = entry->context->op_device_context();
-      assert(device_context != nullptr); 
-      auto stream = device_context->stream();
-
-#if 0
-      cudaMemcpyAsync((void*) entry->output->tensor_data().data(),
-                      (const void*) entry->spec->rbuf(),
-	              entry->tensor.tensor_data().size(),
-		      cudaMemcpyHostToDevice,
-                      stream);
-#endif
-      void* dst_buf = GetBase(entry->output);
-      DeviceMemoryBase gpu_dst_ptr(dst_buf, entry->tensor.tensor_data().size() );
-      stream->ThenMemcpy(&gpu_dst_ptr, entry->spec->rbuf(), (uint64_t) entry->tensor.tensor_data().size());
-      GPU_EVENT_IF_CUDA ready_event = RecordReadyEvent(entry->context);
-      entry->event = ready_event;
-      state.final_list.push_front(entry);
-      it = sharp_list.erase(it);
-      timeline.ActivityStart(entry->name, "HOST TO GPU COPY");
-
-    } else {
-      ++it;
-    }
-  }
-
-
-  std::list<OpTableEntry*>& flist = state.final_list;
-
-
-  //check for data copy events completion, free resources, and call callback
-  std::queue<uint16_t>& freeQ = state.free_queue;
-
-
-
-  for (std::list<OpTableEntry*>::iterator it = flist.begin(); it != flist.end();){
-    OpTableEntry* entry = (*it);
-    if (!entry->event || entry->event->PollForStatus() == perftools::gputools::Event::Status::kComplete){
-      //printf("Tensor %d: Allreduce Completed!\n", entry->idx);
-      
       timeline.ActivityEnd(entry->name);
       timeline.End(entry->name, NULL);
       entry->callback(Status::OK());
       freeQ.push(entry->idx);
       free(entry);
-      it = list.erase(it);
-
+      it = sharp_list.erase(it);
     } else {
       ++it;
     }
   }
-  
-  
+
   if (!freeQ.empty()){
     std::lock_guard<std::mutex> guard(horovod_global.bank_mutex);
     while (!freeQ.empty()){
@@ -1726,7 +1672,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
   bool should_shut_down = false;
   do {
     // This delay determines thread frequency and MPI message latency
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    //std::this_thread::sleep_for(std::chrono::milliseconds(10));
     Send_Sharp(state);
 
     // Copy the data structures from global state under this lock.
@@ -1935,18 +1881,6 @@ void BackgroundThreadLoop(HorovodGlobalState& state) {
     delete it->second;
   }
 
-  // TODO: init.cu:645 WARN Cuda failure 'driver shutting down'
-  //#if HAVE_NCCL
-  //  for (auto it = horovod_global.streams.begin();
-  //       it != horovod_global.streams.end(); it++) {
-  //    cudaStreamSynchronize(it->second);
-  //  }
-  //  for (auto it = horovod_global.nccl_comms.begin();
-  //       it != horovod_global.nccl_comms.end(); it++) {
-  //    ncclCommDestroy(it->second);
-  //  }
-  //#endif
-
   CleanSharp(state);
   MPI_Finalize();
 }
@@ -2119,8 +2053,9 @@ void EnqueueTensorSharpAllreduce(OpKernelContext* context, Tensor& tensor,
       DeviceMemoryBase gpu_src_ptr(src_buf , tsize );
       DeviceMemoryBase gpu_dst_ptr(sharp_spec->sbuf() , tsize );
       stream->ThenMemcpy(&gpu_dst_ptr, gpu_src_ptr, tsize);
-      //printf("Tensor %d Async memcpy in GPU triggered\n", idx);
 
+      void* final_dst_buf = GetBase(output);
+      sharp_spec->setDest(final_dst_buf);
 #endif
     }
   }

@@ -72,7 +72,6 @@ SharpSpec::SharpSpec(size_t buffer_size_, enum sharp_datatype dtype_ ,struct sha
   }
   //specs.rbuf_desc = specs.sbuf_desc; //in place
   
-  specs.rbuf_desc.buffer.ptr = (void*) malloc(byte_size);
   specs.root = 0; //ignored
   specs.dtype = dtype_;
   specs.length = -1;
@@ -85,7 +84,7 @@ SharpSpec::~SharpSpec(){
     throw res;
   }
   free(buffer);
-  free(specs.rbuf_desc.buffer.ptr);
+//  free(specs.rbuf_desc.buffer.ptr);
 #ifndef PUT_ON_GPU
   free(specs.sbuf_desc.buffer.ptr);
 #endif
@@ -110,6 +109,10 @@ void* SharpSpec::sbuf() const{
 
 void* SharpSpec::rbuf() const{
   return specs.rbuf_desc.buffer.ptr;
+}
+
+void SharpSpec::setDest(void* dst){
+  specs.rbuf_desc.buffer.ptr = dst;
 }
 
 cudaStream_t* SharpSpec::stream(){
